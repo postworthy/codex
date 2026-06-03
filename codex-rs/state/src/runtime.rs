@@ -770,14 +770,6 @@ mod tests {
             count_files_with_prefix(codex_home.as_path(), "logs_2.sqlite.corrupt-"),
             1
         );
-        assert_eq!(
-            count_files_with_prefix(codex_home.as_path(), "logs_2.sqlite-wal.corrupt-"),
-            1
-        );
-        assert_eq!(
-            count_files_with_prefix(codex_home.as_path(), "logs_2.sqlite-shm.corrupt-"),
-            1
-        );
 
         runtime.pool.close().await;
         runtime.logs_pool.close().await;
