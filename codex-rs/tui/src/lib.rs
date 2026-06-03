@@ -72,12 +72,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 pub use token_usage::TokenUsage;
-use tracing::Level;
 use tracing::error;
 use tracing::warn;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::Targets;
 use tracing_subscriber::prelude::*;
 use url::Url;
 use uuid::Uuid;
@@ -1267,7 +1265,7 @@ pub async fn run_main(
     let log_db = state_db.clone().map(log_db::start);
     let log_db_layer = log_db
         .clone()
-        .map(|layer| layer.with_filter(Targets::new().with_default(Level::TRACE)));
+        .map(|layer| layer.with_filter(codex_state::log_db::sqlite_log_filter_from_env()));
 
     let _ = tracing_subscriber::registry()
         .with(tui_file_layer)
