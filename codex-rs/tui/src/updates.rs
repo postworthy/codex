@@ -17,10 +17,11 @@ use serde::Serialize;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::version::CODEX_CLI_UPDATE_BASE_VERSION;
 use crate::version::CODEX_CLI_VERSION;
 
 pub fn get_upgrade_version(config: &Config) -> Option<String> {
-    if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
+    if !config.check_for_update_on_startup || source_build_without_update_action() {
         return None;
     }
 
@@ -43,7 +44,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     }
 
     info.and_then(|info| {
-        if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
+        if should_show_upgrade(info.latest_version.as_str()) {
             Some(info.latest_version)
         } else {
             None
@@ -108,9 +109,10 @@ async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> 
             npm_registry::ensure_version_ready(&package_info, &latest_version)?;
             latest_version
         }
-        Some(UpdateAction::StandaloneUnix) | Some(UpdateAction::StandaloneWindows) | None => {
-            fetch_latest_github_release_version().await?
-        }
+        Some(UpdateAction::StandaloneUnix)
+        | Some(UpdateAction::StandaloneWindows)
+        | Some(UpdateAction::SourceGit { .. })
+        | None => fetch_latest_github_release_version().await?,
     };
 
     // Preserve any previously dismissed version if present.
@@ -145,7 +147,7 @@ async fn fetch_latest_github_release_version() -> anyhow::Result<String> {
 /// Returns the latest version to show in a popup, if it should be shown.
 /// This respects the user's dismissal choice for the current latest version.
 pub fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
-    if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
+    if !config.check_for_update_on_startup || source_build_without_update_action() {
         return None;
     }
 
@@ -158,6 +160,20 @@ pub fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
         return None;
     }
     Some(latest)
+}
+
+fn source_build_without_update_action() -> bool {
+    is_source_build_version(CODEX_CLI_VERSION) && crate::version::CODEX_CLI_BUILD_DIR.is_none()
+}
+
+fn should_show_upgrade(latest_version: &str) -> bool {
+    if let Some(update_base_version) = CODEX_CLI_UPDATE_BASE_VERSION {
+        return is_newer(latest_version, update_base_version).unwrap_or(false);
+    }
+
+    is_newer(latest_version, CODEX_CLI_VERSION).unwrap_or(false)
+        || (is_source_build_version(CODEX_CLI_VERSION)
+            && crate::version::CODEX_CLI_BUILD_DIR.is_some())
 }
 
 /// Persist a dismissal for the current latest version so we don't show

@@ -41,7 +41,8 @@ pub(crate) async fn run_update_prompt_if_needed(
     let Some(latest_version) = updates::get_upgrade_version_for_popup(config) else {
         return Ok(UpdatePromptOutcome::Continue);
     };
-    let Some(update_action) = crate::update_action::get_update_action() else {
+    let Some(update_action) = crate::update_action::get_update_action_for_version(&latest_version)
+    else {
         return Ok(UpdatePromptOutcome::Continue);
     };
 
@@ -73,7 +74,9 @@ pub(crate) async fn run_update_prompt_if_needed(
     match screen.selection() {
         Some(UpdateSelection::UpdateNow) => {
             tui.terminal.clear()?;
-            Ok(UpdatePromptOutcome::RunUpdate(update_action))
+            Ok(UpdatePromptOutcome::RunUpdate(
+                screen.update_action().clone(),
+            ))
         }
         Some(UpdateSelection::NotNow) | None => Ok(UpdatePromptOutcome::Continue),
         Some(UpdateSelection::DontRemind) => {
@@ -110,7 +113,7 @@ impl UpdatePromptScreen {
         Self {
             request_frame,
             latest_version,
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: crate::version::CODEX_CLI_DISPLAY_VERSION.to_string(),
             update_action,
             highlighted: UpdateSelection::UpdateNow,
             selection: None,
@@ -162,6 +165,10 @@ impl UpdatePromptScreen {
 
     fn latest_version(&self) -> &str {
         self.latest_version.as_str()
+    }
+
+    fn update_action(&self) -> &UpdateAction {
+        &self.update_action
     }
 }
 
@@ -266,6 +273,23 @@ mod tests {
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render update prompt");
         insta::assert_snapshot!("update_prompt_modal", terminal.backend());
+    }
+
+    #[test]
+    fn source_update_prompt_snapshot() {
+        let screen = UpdatePromptScreen::new(
+            FrameRequester::test_dummy(),
+            "0.136.0".into(),
+            UpdateAction::SourceGit {
+                build_dir: "/home/landon/code/codex".into(),
+                latest_version: "0.136.0".to_string(),
+            },
+        );
+        let mut terminal = Terminal::new(VT100Backend::new(80, 12)).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
+            .expect("render update prompt");
+        insta::assert_snapshot!("source_update_prompt_modal", terminal.backend());
     }
 
     #[test]

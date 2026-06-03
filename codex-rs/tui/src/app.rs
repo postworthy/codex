@@ -78,7 +78,7 @@ use crate::transcript_reflow::TranscriptReflowState;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
-use crate::version::CODEX_CLI_VERSION;
+use crate::version::CODEX_CLI_DISPLAY_VERSION;
 use crate::workspace_command::AppServerWorkspaceCommandRunner;
 use crate::workspace_command::WorkspaceCommandRunner;
 use codex_ansi_escape::ansi_escape_line;
@@ -1105,12 +1105,14 @@ See the Codex keymap documentation for supported actions and examples."
 
         #[cfg(not(debug_assertions))]
         let pre_loop_exit_reason = if let Some(latest_version) = upgrade_version {
+            let update_action =
+                crate::update_action::get_update_action_for_version(&latest_version);
             let control = Box::pin(app.handle_event(
                 tui,
                 &mut app_server,
                 AppEvent::InsertHistoryCell(Box::new(UpdateAvailableHistoryCell::new(
                     latest_version,
-                    crate::update_action::get_update_action(),
+                    update_action,
                 ))),
             ))
             .await?;
@@ -1218,7 +1220,7 @@ See the Codex keymap documentation for supported actions and examples."
             token_usage: app.token_usage(),
             thread_id: resumable_thread.as_ref().map(|thread| thread.thread_id),
             thread_name: resumable_thread.and_then(|thread| thread.thread_name),
-            update_action: app.pending_update_action,
+            update_action: app.pending_update_action.clone(),
             exit_reason,
         })
     }

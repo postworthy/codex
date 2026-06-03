@@ -39,7 +39,11 @@ use codex_utils_cli::SharedCliOptions;
 use codex_utils_cli::resume_hint;
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use supports_color::Stream;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -90,7 +94,7 @@ use codex_terminal_detection::TerminalName;
 #[derive(Debug, Parser)]
 #[clap(
     author,
-    version,
+    version = codex_cli_display_version(),
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like
@@ -114,6 +118,22 @@ struct MultitoolCli {
 
     #[clap(subcommand)]
     subcommand: Option<Subcommand>,
+}
+
+fn codex_cli_display_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let version = option_env!("CODEX_CLI_DISPLAY_VERSION")
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .to_string();
+            if let Some(build_dir) = option_env!("CODEX_CLI_BUILD_DIR") {
+                format!("{version}\nbuild directory: {build_dir}")
+            } else {
+                version
+            }
+        })
+        .as_str()
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -692,7 +712,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
         ExitReason::UserRequested => { /* normal exit */ }
     }
 
-    let update_action = exit_info.update_action;
+    let update_action = exit_info.update_action.clone();
     let color_enabled = supports_color::on(Stream::Stdout).is_some();
     for line in format_exit_messages(exit_info, color_enabled) {
         println!("{line}");
@@ -705,6 +725,14 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
 
 /// Run the update action and print the result.
 fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
+    if let UpdateAction::SourceGit {
+        build_dir,
+        latest_version,
+    } = action
+    {
+        return run_source_git_update(build_dir.as_path(), latest_version.as_str());
+    }
+
     println!();
     let cmd_str = action.command_str();
     println!("Updating Codex via `{cmd_str}`...");
@@ -712,8 +740,10 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     let status = {
         #[cfg(windows)]
         {
-            if action == UpdateAction::StandaloneWindows {
-                let (cmd, args) = action.command_args();
+            if action.is_standalone_windows() {
+                let Some((cmd, args)) = action.command_args() else {
+                    anyhow::bail!("source updates should be handled before running update command");
+                };
                 // Run the standalone PowerShell installer with PowerShell
                 // itself. Routing this through `cmd.exe /C` would parse
                 // PowerShell metacharacters like `|` before PowerShell sees
@@ -728,7 +758,9 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
         }
         #[cfg(not(windows))]
         {
-            let (cmd, args) = action.command_args();
+            let Some((cmd, args)) = action.command_args() else {
+                anyhow::bail!("source updates should be handled before running update command");
+            };
             let command_path = crate::wsl_paths::normalize_for_wsl(cmd);
             let normalized_args: Vec<String> = args
                 .iter()
@@ -743,6 +775,129 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
         anyhow::bail!("`{cmd_str}` failed with status {status}");
     }
     println!("\n🎉 Update ran successfully! Please restart Codex.");
+    Ok(())
+}
+
+fn run_source_git_update(build_dir: &Path, latest_version: &str) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = (build_dir, latest_version);
+        anyhow::bail!(
+            "Source-build auto-update is not supported on Windows yet. Run git pull --ff-only and rebuild Codex manually."
+        );
+    }
+
+    #[cfg(not(windows))]
+    {
+        println!();
+        println!(
+            "Updating Codex from local source checkout at {}...",
+            build_dir.display()
+        );
+        ensure_source_checkout_clean(build_dir)?;
+        run_checked_command(
+            std::process::Command::new("git")
+                .arg("pull")
+                .arg("--ff-only")
+                .current_dir(build_dir),
+            "git pull --ff-only",
+        )?;
+        let display_version = source_update_display_version(latest_version);
+        run_checked_command(
+            std::process::Command::new("cargo")
+                .arg("build")
+                .arg("--release")
+                .arg("--bin")
+                .arg("codex")
+                .current_dir(build_dir.join("codex-rs"))
+                .env("CODEX_CLI_DISPLAY_VERSION", display_version)
+                .env("CODEX_CLI_BUILD_DIR", build_dir)
+                .env("CODEX_CLI_UPDATE_BASE_VERSION", latest_version),
+            "cargo build --release --bin codex",
+        )?;
+        install_source_built_binary(build_dir)?;
+        println!("\n🎉 Source update ran successfully! Please restart Codex.");
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_source_checkout_clean(build_dir: &Path) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("status")
+        .arg("--porcelain")
+        .current_dir(build_dir)
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`git status --porcelain` failed with status {}",
+            output.status
+        );
+    }
+    if !output.stdout.is_empty() {
+        anyhow::bail!(
+            "Source checkout at {} has uncommitted changes. Commit, stash, or discard them before updating.",
+            build_dir.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn run_checked_command(command: &mut std::process::Command, label: &str) -> anyhow::Result<()> {
+    println!("Running `{label}`...");
+    let status = command.status()?;
+    if !status.success() {
+        anyhow::bail!("`{label}` failed with status {status}");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn source_update_display_version(latest_version: &str) -> String {
+    std::process::Command::new("date")
+        .arg("+%Y.%m.%d")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|date| format!("{} local", date.trim()))
+        .filter(|version| version != " local")
+        .unwrap_or_else(|| format!("{latest_version} local"))
+}
+
+#[cfg(not(windows))]
+fn install_source_built_binary(build_dir: &Path) -> anyhow::Result<()> {
+    let source_bin = build_dir.join("codex-rs").join("target/release/codex");
+    let installed_bin = std::env::current_exe()?;
+    let installed_dir = installed_bin
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("current executable has no parent directory"))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let backup = installed_bin.with_file_name(format!(
+        "{}.bak.{timestamp}",
+        installed_bin
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("codex")
+    ));
+    let temp = installed_dir.join(format!(".codex-update-{timestamp}"));
+
+    std::fs::copy(&installed_bin, &backup)?;
+    std::fs::copy(&source_bin, &temp)?;
+    let mut permissions = std::fs::metadata(&temp)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+    }
+    std::fs::set_permissions(&temp, permissions)?;
+    std::fs::rename(&temp, &installed_bin)?;
+    println!("Installed updated binary to {}", installed_bin.display());
+    println!("Previous binary backed up to {}", backup.display());
     Ok(())
 }
 
@@ -2689,6 +2844,17 @@ mod tests {
             command
                 .get_subcommands()
                 .all(|subcommand| subcommand.get_name() != "responses")
+        );
+    }
+
+    #[test]
+    fn version_flag_uses_cli_display_version() {
+        let err = MultitoolCli::try_parse_from(["codex", "--version"])
+            .expect_err("version should short-circuit");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(
+            err.to_string(),
+            format!("codex-cli {}\n", codex_cli_display_version())
         );
     }
 

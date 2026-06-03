@@ -1,3 +1,8 @@
+# Repository sync
+
+- When asked to sync this repository, use `scripts/sync-fork.sh` from the repo root. This keeps the fork remote (`origin`) synchronized from the original OpenAI remote (`upstream`) and only fast-forwards the local branch when the worktree is clean.
+- Do not manually run the individual `git fetch upstream`, `git push origin upstream/main:main`, or `git pull --ff-only origin main` sequence unless the sync script is missing or fails in a way that requires diagnosis.
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
