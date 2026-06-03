@@ -30,6 +30,7 @@ use crate::model::epoch_millis_to_datetime;
 use crate::paths::file_modified_time_utc;
 use crate::telemetry::DbKind;
 use crate::telemetry::DbTelemetry;
+use anyhow::Context;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
@@ -195,14 +196,16 @@ impl StateRuntime {
                 return Err(err);
             }
         };
-        let logs_pool = match open_logs_sqlite(&logs_path, &logs_migrator, telemetry_override).await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open logs db at {}: {err}", logs_path.display());
-                return Err(err);
-            }
-        };
+        let logs_pool =
+            match open_logs_sqlite_with_recovery(&logs_path, &logs_migrator, telemetry_override)
+                .await
+            {
+                Ok(db) => Arc::new(db),
+                Err(err) => {
+                    warn!("failed to open logs db at {}: {err}", logs_path.display());
+                    return Err(err);
+                }
+            };
         let goals_pool =
             match open_goals_sqlite(&goals_path, &goals_migrator, telemetry_override).await {
                 Ok(db) => Arc::new(db),
@@ -331,6 +334,103 @@ async fn open_logs_sqlite(
     open_sqlite(path, migrator, LOGS_DB, telemetry_override).await
 }
 
+async fn open_logs_sqlite_with_recovery(
+    path: &Path,
+    migrator: &Migrator,
+    telemetry_override: Option<&dyn DbTelemetry>,
+) -> anyhow::Result<SqlitePool> {
+    match open_logs_sqlite(path, migrator, telemetry_override).await {
+        Ok(pool) => Ok(pool),
+        Err(err) if is_recoverable_logs_db_error(&err) => {
+            warn!(
+                "logs db at {} is corrupt; moving it aside and recreating it",
+                path.display()
+            );
+            quarantine_logs_sqlite_files(path)
+                .await
+                .with_context(|| format!("failed to quarantine logs db at {}", path.display()))?;
+            open_logs_sqlite(path, migrator, telemetry_override)
+                .await
+                .with_context(|| format!("failed to recreate logs db at {}", path.display()))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn is_recoverable_logs_db_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(sqlx_err) = cause.downcast_ref::<sqlx::Error>()
+            && is_recoverable_sqlite_error(sqlx_err)
+        {
+            return true;
+        }
+    }
+
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("file is not a database")
+        || message.contains("database disk image is malformed")
+}
+
+fn is_recoverable_sqlite_error(err: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(database_error) = err else {
+        return false;
+    };
+    let primary_code = database_error
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .map(|code| code & 0xff);
+    let message = database_error.message().to_ascii_lowercase();
+    matches!(primary_code, Some(11 | 26))
+        || message.contains("file is not a database")
+        || message.contains("database disk image is malformed")
+}
+
+async fn quarantine_logs_sqlite_files(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let suffix = format!(".corrupt-{}", Utc::now().format("%Y%m%d-%H%M%S"));
+    let mut moved = Vec::new();
+    for path in sqlite_path_triplet(path) {
+        if tokio::fs::try_exists(path.as_path()).await? {
+            moved.push(quarantine_path(path.as_path(), suffix.as_str()).await?);
+        }
+    }
+    Ok(moved)
+}
+
+fn sqlite_path_triplet(path: &Path) -> Vec<PathBuf> {
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    let mut shm_path = path.as_os_str().to_os_string();
+    shm_path.push("-shm");
+    vec![
+        path.to_path_buf(),
+        PathBuf::from(wal_path),
+        PathBuf::from(shm_path),
+    ]
+}
+
+async fn quarantine_path(path: &Path, suffix: &str) -> std::io::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "cannot create a quarantine name for {}",
+            path.display()
+        ))
+    })?;
+    let mut sequence = 0;
+    loop {
+        let mut quarantine_name = file_name.to_os_string();
+        quarantine_name.push(suffix);
+        if sequence > 0 {
+            quarantine_name.push(format!(".{sequence}"));
+        }
+        let quarantine_path = path.with_file_name(quarantine_name);
+        if !tokio::fs::try_exists(quarantine_path.as_path()).await? {
+            tokio::fs::rename(path, quarantine_path.as_path()).await?;
+            return Ok(quarantine_path);
+        }
+        sequence += 1;
+    }
+}
+
 async fn open_goals_sqlite(
     path: &Path,
     migrator: &Migrator,
@@ -377,7 +477,10 @@ async fn open_sqlite(
         started.elapsed(),
         &migrate_result,
     );
-    migrate_result?;
+    if let Err(err) = migrate_result {
+        pool.close().await;
+        return Err(err);
+    }
     Ok(pool)
 }
 
@@ -462,6 +565,7 @@ pub async fn sqlite_integrity_check(path: &Path) -> anyhow::Result<Vec<String>> 
 #[cfg(test)]
 mod tests {
     use super::StateRuntime;
+    use super::logs_db_path;
     use super::open_state_sqlite;
     use super::runtime_state_migrator;
     use super::sqlite_integrity_check;
@@ -540,6 +644,14 @@ mod tests {
         .expect("open sqlite pool")
     }
 
+    fn count_files_with_prefix(dir: &Path, prefix: &str) -> usize {
+        std::fs::read_dir(dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .count()
+    }
+
     #[tokio::test]
     async fn sqlite_integrity_check_reports_ok_for_valid_db() {
         let codex_home = unique_temp_dir();
@@ -616,6 +728,87 @@ mod tests {
         .await
         .expect("runtime migrator should tolerate newer applied migrations");
         tolerant_pool.close().await;
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn init_quarantines_and_recreates_corrupt_logs_db() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let logs_path = logs_db_path(codex_home.as_path());
+        let mut logs_wal_path = logs_path.as_os_str().to_os_string();
+        logs_wal_path.push("-wal");
+        let logs_wal_path = std::path::PathBuf::from(logs_wal_path);
+        let mut logs_shm_path = logs_path.as_os_str().to_os_string();
+        logs_shm_path.push("-shm");
+        let logs_shm_path = std::path::PathBuf::from(logs_shm_path);
+        tokio::fs::write(logs_path.as_path(), b"not sqlite")
+            .await
+            .expect("write corrupt logs db");
+        tokio::fs::write(logs_wal_path.as_path(), b"not sqlite wal")
+            .await
+            .expect("write corrupt logs wal");
+        tokio::fs::write(logs_shm_path.as_path(), b"not sqlite shm")
+            .await
+            .expect("write corrupt logs shm");
+
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state runtime should recover corrupt logs db");
+
+        assert!(tokio::fs::try_exists(logs_path.as_path()).await.unwrap());
+        assert_eq!(
+            sqlite_integrity_check(logs_path.as_path())
+                .await
+                .expect("integrity check should run"),
+            vec!["ok".to_string()]
+        );
+        assert_eq!(
+            count_files_with_prefix(codex_home.as_path(), "logs_2.sqlite.corrupt-"),
+            1
+        );
+        assert_eq!(
+            count_files_with_prefix(codex_home.as_path(), "logs_2.sqlite-wal.corrupt-"),
+            1
+        );
+        assert_eq!(
+            count_files_with_prefix(codex_home.as_path(), "logs_2.sqlite-shm.corrupt-"),
+            1
+        );
+
+        runtime.pool.close().await;
+        runtime.logs_pool.close().await;
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn init_does_not_quarantine_corrupt_state_db() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let state_path = state_db_path(codex_home.as_path());
+        tokio::fs::write(state_path.as_path(), b"not sqlite")
+            .await
+            .expect("write corrupt state db");
+
+        let result = StateRuntime::init(codex_home.clone(), "test-provider".to_string()).await;
+        assert!(result.is_err(), "corrupt state db should remain fatal");
+
+        assert!(tokio::fs::try_exists(state_path.as_path()).await.unwrap());
+        assert_eq!(
+            count_files_with_prefix(codex_home.as_path(), "state_5.sqlite.corrupt-"),
+            0
+        );
+        assert_eq!(
+            tokio::fs::read(state_path.as_path())
+                .await
+                .expect("read original state db"),
+            b"not sqlite"
+        );
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

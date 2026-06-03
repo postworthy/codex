@@ -35,6 +35,7 @@ use tracing::span::Id;
 use tracing::span::Record;
 use tracing_subscriber::Layer;
 use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::FormattedFields;
 use tracing_subscriber::fmt::format::DefaultFields;
@@ -47,7 +48,6 @@ use crate::StateRuntime;
 const LOG_QUEUE_CAPACITY: usize = 512;
 const LOG_BATCH_SIZE: usize = 128;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogSinkQueueConfig {
     pub queue_capacity: usize,
@@ -98,6 +98,28 @@ pub struct LogDbLayer {
 
 pub fn start(state_db: std::sync::Arc<StateRuntime>) -> LogDbLayer {
     LogDbLayer::start(state_db)
+}
+
+/// Build the production filter for logs persisted to the local SQLite log DB.
+///
+/// The persistent log sink follows `RUST_LOG` when it is set. Without an
+/// explicit filter, it keeps production logging at INFO and above so TRACE
+/// streams remain opt-in for disk persistence.
+pub fn sqlite_log_filter_from_env() -> Targets {
+    std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|directives| sqlite_log_filter_from_directives(&directives).ok())
+        .unwrap_or_else(default_sqlite_log_filter)
+}
+
+fn default_sqlite_log_filter() -> Targets {
+    Targets::new().with_default(tracing::Level::INFO)
+}
+
+fn sqlite_log_filter_from_directives(
+    directives: &str,
+) -> Result<Targets, tracing_subscriber::filter::ParseError> {
+    directives.parse()
 }
 
 impl Clone for LogDbLayer {
@@ -629,6 +651,94 @@ mod tests {
             .expect("query logs after flush");
         assert_eq!(after_flush.len(), 1);
         assert_eq!(after_flush[0].message.as_deref(), Some("buffered-log"));
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_log_filter_defaults_to_info() {
+        let codex_home = temp_codex_home();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let layer = LogDbLayer::start_with_config(
+            runtime.clone(),
+            LogSinkQueueConfig {
+                queue_capacity: 8,
+                batch_size: 128,
+                flush_interval: std::time::Duration::from_secs(60),
+            },
+        );
+
+        let guard = tracing_subscriber::registry()
+            .with(layer.clone().with_filter(default_sqlite_log_filter()))
+            .set_default();
+
+        tracing::trace!("filtered-trace-log");
+        tracing::debug!("filtered-debug-log");
+        tracing::info!("persisted-info-log");
+        tracing::warn!("persisted-warn-log");
+
+        layer.flush().await;
+        drop(guard);
+
+        let rows = runtime
+            .query_logs(&crate::LogQuery::default())
+            .await
+            .expect("query filtered logs");
+        let persisted = rows
+            .iter()
+            .map(|row| (row.level.as_str(), row.message.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted,
+            vec![
+                ("INFO", Some("persisted-info-log")),
+                ("WARN", Some("persisted-warn-log")),
+            ]
+        );
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_log_filter_respects_rust_log_directives() {
+        let codex_home = temp_codex_home();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let layer = LogDbLayer::start_with_config(
+            runtime.clone(),
+            LogSinkQueueConfig {
+                queue_capacity: 8,
+                batch_size: 128,
+                flush_interval: std::time::Duration::from_secs(60),
+            },
+        );
+
+        let guard = tracing_subscriber::registry()
+            .with(
+                layer
+                    .clone()
+                    .with_filter(sqlite_log_filter_from_directives("warn").expect("valid filter")),
+            )
+            .set_default();
+
+        tracing::info!("filtered-info-log");
+        tracing::warn!("persisted-warn-log");
+
+        layer.flush().await;
+        drop(guard);
+
+        let rows = runtime
+            .query_logs(&crate::LogQuery::default())
+            .await
+            .expect("query filtered logs");
+        let persisted = rows
+            .iter()
+            .map(|row| (row.level.as_str(), row.message.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(persisted, vec![("WARN", Some("persisted-warn-log"))]);
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
