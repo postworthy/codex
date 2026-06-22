@@ -729,14 +729,12 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
 }
 
 fn reload_current_session(exit_info: &AppExitInfo) -> anyhow::Result<()> {
-    let Some(thread_id) = exit_info.thread_id else {
-        anyhow::bail!("cannot reload because the current session is not resumable");
-    };
-    let thread_id = thread_id.to_string();
-
     let program = reload_program();
     let mut command = std::process::Command::new(&program);
-    command.arg("resume").arg(&thread_id);
+    let thread_id = exit_info.thread_id.map(|thread_id| thread_id.to_string());
+    if let Some(thread_id) = thread_id.as_deref() {
+        command.arg("resume").arg(thread_id);
+    }
 
     #[cfg(unix)]
     {
@@ -745,7 +743,7 @@ fn reload_current_session(exit_info: &AppExitInfo) -> anyhow::Result<()> {
         let err = command.exec();
         anyhow::bail!(
             "failed to reload Codex with `{}`: {err}",
-            reload_command_display(&program, &thread_id)
+            reload_command_display(&program, thread_id.as_deref())
         );
     }
 
@@ -754,7 +752,7 @@ fn reload_current_session(exit_info: &AppExitInfo) -> anyhow::Result<()> {
         let status = command.status().map_err(|err| {
             anyhow::anyhow!(
                 "failed to reload Codex with `{}`: {err}",
-                reload_command_display(&program, &thread_id)
+                reload_command_display(&program, thread_id.as_deref())
             )
         })?;
         std::process::exit(status.code().unwrap_or(1));
@@ -775,8 +773,11 @@ fn reload_program() -> OsString {
         .unwrap_or_else(|_| OsString::from("codex"))
 }
 
-fn reload_command_display(program: &OsString, thread_id: &str) -> String {
-    format!("{} resume {thread_id}", program.to_string_lossy())
+fn reload_command_display(program: &OsString, thread_id: Option<&str>) -> String {
+    match thread_id {
+        Some(thread_id) => format!("{} resume {thread_id}", program.to_string_lossy()),
+        None => program.to_string_lossy().into_owned(),
+    }
 }
 
 /// Run the update action and print the result.

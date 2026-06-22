@@ -362,12 +362,6 @@ impl ChatWidget {
                 self.open_memories_popup();
             }
             SlashCommand::Reload => {
-                if self.thread_id().is_none() || self.rollout_path().is_none() {
-                    self.add_error_message(
-                        "Cannot reload before this session is resumable.".to_string(),
-                    );
-                    return;
-                }
                 self.request_reload_without_confirmation();
             }
             SlashCommand::Quit | SlashCommand::Exit => {
