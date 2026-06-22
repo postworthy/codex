@@ -1651,6 +1651,32 @@ async fn slash_exit_requests_exit() {
 }
 
 #[tokio::test]
+async fn slash_reload_requests_reload_for_resumable_session() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.current_rollout_path = Some(test_path_buf("rollout.jsonl"));
+
+    chat.dispatch_command(SlashCommand::Reload);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::Reload)));
+}
+
+#[tokio::test]
+async fn slash_reload_requires_resumable_session() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Reload);
+
+    let cells = drain_insert_history(&mut rx);
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Cannot reload before this session is resumable."),
+        "expected reload error, got {rendered:?}"
+    );
+    assert!(rx.try_recv().is_err(), "reload should not request exit");
+}
+
+#[tokio::test]
 async fn slash_stop_submits_background_terminal_cleanup() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

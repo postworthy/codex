@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("ERROR: {message}");
                 std::process::exit(1);
             }
-            ExitReason::UserRequested => {}
+            ExitReason::UserRequested | ExitReason::ReloadRequested => {}
         }
 
         let color_enabled = supports_color::on(Stream::Stdout).is_some();

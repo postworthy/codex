@@ -1374,6 +1374,14 @@ impl ChatWidget {
             .send(AppEvent::Exit(ExitMode::ShutdownFirst));
     }
 
+    /// Request a shutdown-first reload.
+    ///
+    /// This branch-local command exits through the normal app boundary so the
+    /// CLI can replace the process with a fresh `codex resume <thread-id>`.
+    fn request_reload_without_confirmation(&self) {
+        self.app_event_tx.send(AppEvent::Exit(ExitMode::Reload));
+    }
+
     pub(crate) fn show_shutdown_in_progress(&mut self) {
         self.bottom_pane.show_shutdown_in_progress();
     }

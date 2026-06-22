@@ -15,6 +15,7 @@ pub enum SlashCommand {
     Model,
     Ide,
     Permissions,
+    Reload,
     Keymap,
     Vim,
     #[strum(serialize = "setup-default-sandbox")]
@@ -92,6 +93,7 @@ impl SlashCommand {
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
             SlashCommand::App => "continue this session in Codex Desktop",
+            SlashCommand::Reload => "restart Codex and resume this session",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Copy => "copy last response as markdown",
             SlashCommand::Raw => "toggle raw scrollback mode for copy-friendly terminal selection",
@@ -189,6 +191,7 @@ impl SlashCommand {
             | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact
+            | SlashCommand::Reload
             | SlashCommand::Model
             | SlashCommand::Personality
             | SlashCommand::Permissions
@@ -272,6 +275,12 @@ mod tests {
     #[test]
     fn clean_alias_parses_to_stop_command() {
         assert_eq!(SlashCommand::from_str("clean"), Ok(SlashCommand::Stop));
+    }
+
+    #[test]
+    fn reload_command_parses() {
+        assert_eq!(SlashCommand::from_str("reload"), Ok(SlashCommand::Reload));
+        assert_eq!(SlashCommand::Reload.command(), "reload");
     }
 
     #[test]

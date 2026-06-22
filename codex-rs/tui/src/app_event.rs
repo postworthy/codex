@@ -1042,6 +1042,8 @@ pub(crate) struct RealtimeWebrtcOffer {
 pub(crate) enum ExitMode {
     /// Shutdown core and exit after completion.
     ShutdownFirst,
+    /// Shutdown core, then replace the current process with `codex resume`.
+    Reload,
     /// Exit the UI loop immediately without waiting for shutdown.
     ///
     /// This skips `Op::Shutdown`, so any in-flight work may be dropped and

@@ -488,6 +488,34 @@ mod tests {
     }
 
     #[test]
+    fn reload_shown_for_prefix() {
+        let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
+        popup.on_composer_text_change("/rel".to_string());
+
+        assert_eq!(
+            popup.selected_item(),
+            Some(CommandItem::Builtin(SlashCommand::Reload))
+        );
+    }
+
+    #[test]
+    fn reload_shown_in_initial_page() {
+        let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
+        popup.on_composer_text_change("/".to_string());
+
+        let visible_items: Vec<CommandItem> = popup
+            .filtered_items()
+            .into_iter()
+            .take(MAX_POPUP_ROWS)
+            .collect();
+
+        assert!(
+            visible_items.contains(&CommandItem::Builtin(SlashCommand::Reload)),
+            "expected '/reload' in the first page, got {visible_items:?}"
+        );
+    }
+
+    #[test]
     fn plan_command_hidden_when_collaboration_modes_disabled() {
         let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
         popup.on_composer_text_change("/".to_string());

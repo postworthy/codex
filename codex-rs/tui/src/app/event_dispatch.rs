@@ -302,7 +302,7 @@ impl App {
                 self.chat_widget.on_commit_tick();
             }
             AppEvent::Exit(mode) => {
-                if mode == ExitMode::ShutdownFirst {
+                if matches!(mode, ExitMode::ShutdownFirst | ExitMode::Reload) {
                     self.show_shutdown_feedback(tui)?;
                 }
                 return Ok(self.handle_exit_mode(app_server, mode).await);
@@ -2181,7 +2181,7 @@ impl App {
         mode: ExitMode,
     ) -> AppRunControl {
         match mode {
-            ExitMode::ShutdownFirst => {
+            ExitMode::ShutdownFirst | ExitMode::Reload => {
                 // Mark the thread we are explicitly shutting down for exit so
                 // its shutdown completion does not trigger agent failover.
                 self.pending_shutdown_exit_thread_id =
@@ -2203,7 +2203,12 @@ impl App {
                     }
                 }
                 self.pending_shutdown_exit_thread_id = None;
-                AppRunControl::Exit(ExitReason::UserRequested)
+                let reason = match mode {
+                    ExitMode::ShutdownFirst => ExitReason::UserRequested,
+                    ExitMode::Reload => ExitReason::ReloadRequested,
+                    ExitMode::Immediate => unreachable!("handled in separate match arm"),
+                };
+                AppRunControl::Exit(reason)
             }
             ExitMode::Immediate => {
                 self.pending_shutdown_exit_thread_id = None;

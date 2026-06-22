@@ -38,6 +38,7 @@ use codex_utils_cli::ProfileV2Name;
 use codex_utils_cli::SharedCliOptions;
 use codex_utils_cli::resume_hint;
 use owo_colors::OwoColorize;
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::path::PathBuf;
@@ -710,6 +711,10 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
             std::process::exit(1);
         }
         ExitReason::UserRequested => { /* normal exit */ }
+        ExitReason::ReloadRequested => {
+            reload_current_session(&exit_info)?;
+            return Ok(());
+        }
     }
 
     let update_action = exit_info.update_action.clone();
@@ -721,6 +726,57 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
         run_update_action(action)?;
     }
     Ok(())
+}
+
+fn reload_current_session(exit_info: &AppExitInfo) -> anyhow::Result<()> {
+    let Some(thread_id) = exit_info.thread_id else {
+        anyhow::bail!("cannot reload because the current session is not resumable");
+    };
+    let thread_id = thread_id.to_string();
+
+    let program = reload_program();
+    let mut command = std::process::Command::new(&program);
+    command.arg("resume").arg(&thread_id);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let err = command.exec();
+        anyhow::bail!(
+            "failed to reload Codex with `{}`: {err}",
+            reload_command_display(&program, &thread_id)
+        );
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = command.status().map_err(|err| {
+            anyhow::anyhow!(
+                "failed to reload Codex with `{}`: {err}",
+                reload_command_display(&program, &thread_id)
+            )
+        })?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn reload_program() -> OsString {
+    if let Some(program) = std::env::var_os("CODEX_RELOAD_BIN").filter(|value| !value.is_empty()) {
+        return program;
+    }
+
+    if let Some(program) = std::env::args_os().next().filter(|value| !value.is_empty()) {
+        return program;
+    }
+
+    std::env::current_exe()
+        .map(OsString::from)
+        .unwrap_or_else(|_| OsString::from("codex"))
+}
+
+fn reload_command_display(program: &OsString, thread_id: &str) -> String {
+    format!("{} resume {thread_id}", program.to_string_lossy())
 }
 
 /// Run the update action and print the result.

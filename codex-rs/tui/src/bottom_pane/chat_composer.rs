@@ -8219,6 +8219,51 @@ mod tests {
     }
 
     #[test]
+    fn slash_reload_dispatches_command_and_does_not_submit_literal_text() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'r', 'e', 'l', 'o', 'a', 'd']);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::Command(cmd) => {
+                assert_eq!(cmd, SlashCommand::Reload);
+            }
+            InputResult::CommandWithArgs(_, _, _) => {
+                panic!("expected command dispatch without args for '/reload'")
+            }
+            InputResult::ServiceTierCommand(command) => {
+                panic!("expected reload command, got service tier {command:?}")
+            }
+            InputResult::Submitted { text, .. } => {
+                panic!("expected command dispatch, but composer submitted literal text: {text}")
+            }
+            InputResult::Queued { .. } => {
+                panic!("expected command dispatch, but composer queued literal text")
+            }
+            InputResult::None => panic!("expected Command result for '/reload'"),
+        }
+        assert!(
+            composer.draft.textarea.is_empty(),
+            "composer should be cleared"
+        );
+    }
+
+    #[test]
     fn kill_buffer_persists_after_submit() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
