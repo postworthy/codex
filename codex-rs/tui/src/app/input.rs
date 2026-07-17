@@ -4,9 +4,7 @@
 //! entry, Ctrl-L clear, external editor launch, and agent navigation shortcuts.
 
 use super::*;
-
-const SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE: &str =
-    "Editing previous prompts is unavailable in side conversations.";
+use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
 
 impl App {
     pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
@@ -235,7 +233,8 @@ impl App {
                 && self.chat_widget.composer_is_empty() =>
             {
                 if let Some(selection) = self.confirm_backtrack_from_main() {
-                    self.apply_backtrack_selection(tui, selection);
+                    self.apply_backtrack_selection(selection);
+                    tui.frame_requester().schedule_frame();
                 }
             }
             KeyEvent {

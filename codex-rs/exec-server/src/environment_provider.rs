@@ -1,4 +1,5 @@
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::Environment;
 use crate::ExecServerError;
@@ -13,11 +14,13 @@ use crate::environment::REMOTE_ENVIRONMENT_ID;
 /// selection. Providers should only return provider-owned remote environments;
 /// `include_local` controls whether `EnvironmentManager` should add the local
 /// environment to the snapshot.
-#[async_trait]
 pub trait EnvironmentProvider: Send + Sync {
     /// Returns the provider-owned environment startup snapshot.
-    async fn snapshot(&self) -> Result<EnvironmentProviderSnapshot, ExecServerError>;
+    fn snapshot(&self) -> EnvironmentProviderFuture<'_>;
 }
+
+pub type EnvironmentProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<EnvironmentProviderSnapshot, ExecServerError>> + Send + 'a>>;
 
 #[derive(Clone, Debug)]
 pub struct EnvironmentProviderSnapshot {
@@ -80,10 +83,9 @@ impl DefaultEnvironmentProvider {
     }
 }
 
-#[async_trait]
 impl EnvironmentProvider for DefaultEnvironmentProvider {
-    async fn snapshot(&self) -> Result<EnvironmentProviderSnapshot, ExecServerError> {
-        Ok(self.snapshot_inner())
+    fn snapshot(&self) -> EnvironmentProviderFuture<'_> {
+        Box::pin(async { Ok(self.snapshot_inner()) })
     }
 }
 
@@ -176,24 +178,16 @@ mod tests {
         let remote_environment = &environments[REMOTE_ENVIRONMENT_ID];
         assert!(remote_environment.is_remote());
         assert_eq!(
-            remote_environment.exec_server_url(),
-            Some("ws://127.0.0.1:8765")
-        );
-        assert_eq!(
             default,
             EnvironmentDefault::EnvironmentId(REMOTE_ENVIRONMENT_ID.to_string())
         );
     }
 
-    #[tokio::test]
-    async fn default_provider_normalizes_exec_server_url() {
-        let provider = DefaultEnvironmentProvider::new(Some(" ws://127.0.0.1:8765 ".to_string()));
-        let snapshot = provider.snapshot().await.expect("environments");
-        let environments: HashMap<_, _> = snapshot.environments.into_iter().collect();
-
+    #[test]
+    fn normalizes_exec_server_url() {
         assert_eq!(
-            environments[REMOTE_ENVIRONMENT_ID].exec_server_url(),
-            Some("ws://127.0.0.1:8765")
+            normalize_exec_server_url(Some(" ws://127.0.0.1:8765 ".to_string())),
+            (Some("ws://127.0.0.1:8765".to_string()), false)
         );
     }
 }

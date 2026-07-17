@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used)]
-
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,6 +26,7 @@ const FIXED_CWD: &str = "/tmp/codex_remote_compaction_parity_workspace";
 const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 const SUMMARY: &str = "REMOTE_COMPACTION_PARITY_ENCRYPTED_SUMMARY";
 const DUMMY_FUNCTION_NAME: &str = "test_tool";
+const USER_INSTRUCTIONS: &str = "PARITY_USER_INSTRUCTIONS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -508,7 +507,12 @@ async fn build_harness_inner(
     auto_compact_limit: Option<i64>,
 ) -> Result<TestCodexHarness> {
     fs::create_dir_all(FIXED_CWD)?;
-    let mut builder = test_codex().with_auth(settings.auth.build());
+    let mut builder = test_codex()
+        .with_auth(settings.auth.build())
+        .with_pre_build_hook(|home| {
+            fs::write(home.join("AGENTS.md"), USER_INSTRUCTIONS)
+                .expect("write global instructions");
+        });
     if hooks {
         builder = builder.with_pre_build_hook(write_manual_compact_hooks);
     }
@@ -517,7 +521,6 @@ async fn build_harness_inner(
             FIXED_CWD,
         ))
         .expect("fixed cwd should be absolute");
-        config.user_instructions = Some("PARITY_USER_INSTRUCTIONS".to_string());
         config.developer_instructions = Some("PARITY_DEVELOPER_INSTRUCTIONS".to_string());
         if settings.service_tier_fast {
             config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
@@ -526,8 +529,8 @@ async fn build_harness_inner(
         if hooks {
             trust_discovered_hooks(config);
         }
-        if mode == Mode::V2 {
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        if mode == Mode::Legacy {
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
         }
     }))
     .await
@@ -602,7 +605,6 @@ async fn capture_from_requests(
 async fn submit_user_input(codex: &codex_core::CodexThread, items: Vec<UserInput>) -> Result<()> {
     codex
         .submit(Op::UserInput {
-            environments: None,
             items,
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
@@ -922,6 +924,7 @@ fn normalize_value(value: Value) -> Value {
         Value::Array(values) => Value::Array(values.into_iter().map(normalize_value).collect()),
         Value::Object(map) => Value::Object(
             map.into_iter()
+                .filter(|(key, _value)| key != "internal_chat_message_metadata_passthrough")
                 .map(|(key, value)| (key, normalize_value(value)))
                 .collect(),
         ),
@@ -937,6 +940,19 @@ fn normalize_string(value: &str) -> String {
     let mut text = value.to_string();
     normalize_tmp_prefix_before_marker(&mut text, "/skills/");
     normalize_tmp_prefix_before_marker(&mut text, "\\skills\\");
+
+    let skills_open_tag = "<skills_instructions>";
+    let skills_close_tag = "</skills_instructions>";
+    let mut search_start = 0;
+    while let Some(relative_start) = text[search_start..].find(skills_open_tag) {
+        let body_start = search_start + relative_start + skills_open_tag.len();
+        let Some(relative_end) = text[body_start..].find(skills_close_tag) else {
+            break;
+        };
+        let body_end = body_start + relative_end;
+        text.replace_range(body_start..body_end, "\n...\n");
+        search_start = body_start + "\n...\n".len() + skills_close_tag.len();
+    }
 
     let mut search_start = 0;
     let wall_time_prefix = "Wall time: ";
@@ -959,6 +975,19 @@ fn normalize_string(value: &str) -> String {
         }
     }
     text
+}
+
+#[test]
+fn normalize_string_rewrites_dynamic_skill_instructions() {
+    let text = normalize_string(
+        "before\n<skills_instructions>\n## Skills\n- demo: Dynamic description\n\
+         </skills_instructions>\nafter",
+    );
+
+    assert_eq!(
+        text,
+        "before\n<skills_instructions>\n...\n</skills_instructions>\nafter"
+    );
 }
 
 fn is_uuid_like(value: &str) -> bool {

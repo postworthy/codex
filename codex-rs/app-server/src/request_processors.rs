@@ -1,5 +1,4 @@
 use crate::bespoke_event_handling::apply_bespoke_event_handling;
-use crate::bespoke_event_handling::maybe_emit_hook_prompt_item_completed;
 use crate::command_exec::CommandExecManager;
 use crate::command_exec::StartCommandExecParams;
 use crate::config_manager::ConfigManager;
@@ -22,16 +21,21 @@ use codex_analytics::InputError;
 use codex_analytics::TurnSteerRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
+use codex_app_server_protocol::AccountTokenUsageDailyBucket;
+use codex_app_server_protocol::AccountTokenUsageSummary;
 use codex_app_server_protocol::AccountUpdatedNotification;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
 use codex_app_server_protocol::AdditionalContextEntry;
 use codex_app_server_protocol::AdditionalContextKind;
-use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::AppListUpdatedNotification;
 use codex_app_server_protocol::AppSummary;
+use codex_app_server_protocol::AppTemplateSummary;
+use codex_app_server_protocol::AppTemplateUnavailableReason;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
+use codex_app_server_protocol::AppsReadParams;
+use codex_app_server_protocol::AppsReadResponse;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::CancelLoginAccountParams;
@@ -48,11 +52,23 @@ use codex_app_server_protocol::CommandExecResizeParams;
 use codex_app_server_protocol::CommandExecTerminateParams;
 use codex_app_server_protocol::CommandExecWriteParams;
 use codex_app_server_protocol::ConfigWarningNotification;
+use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditOutcome;
+use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditParams;
+use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
 use codex_app_server_protocol::ConversationGitInfo;
 use codex_app_server_protocol::ConversationSummary;
-use codex_app_server_protocol::DynamicToolSpec as ApiDynamicToolSpec;
+use codex_app_server_protocol::DeprecationNoticeNotification;
+use codex_app_server_protocol::DynamicToolFunctionSpec;
+use codex_app_server_protocol::DynamicToolNamespaceTool;
+use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::EnvironmentAddParams;
 use codex_app_server_protocol::EnvironmentAddResponse;
+use codex_app_server_protocol::EnvironmentInfoParams;
+use codex_app_server_protocol::EnvironmentInfoResponse;
+use codex_app_server_protocol::EnvironmentShellInfo;
+use codex_app_server_protocol::EnvironmentStatusKind;
+use codex_app_server_protocol::EnvironmentStatusParams;
+use codex_app_server_protocol::EnvironmentStatusResponse;
 use codex_app_server_protocol::ExperimentalFeature as ApiExperimentalFeature;
 use codex_app_server_protocol::ExperimentalFeatureListParams;
 use codex_app_server_protocol::ExperimentalFeatureListResponse;
@@ -62,10 +78,12 @@ use codex_app_server_protocol::FeedbackUploadResponse;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
+use codex_app_server_protocol::GetAccountTokenUsageResponse;
 use codex_app_server_protocol::GetAuthStatusParams;
 use codex_app_server_protocol::GetAuthStatusResponse;
 use codex_app_server_protocol::GetConversationSummaryParams;
 use codex_app_server_protocol::GetConversationSummaryResponse;
+use codex_app_server_protocol::GetWorkspaceMessagesResponse;
 use codex_app_server_protocol::GitDiffToRemoteParams;
 use codex_app_server_protocol::GitDiffToRemoteResponse;
 use codex_app_server_protocol::GitInfo as ApiGitInfo;
@@ -80,6 +98,7 @@ use codex_app_server_protocol::ListMcpServerStatusResponse;
 use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::LoginApiKeyParams;
+use codex_app_server_protocol::LoginAppBrand;
 use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::MarketplaceAddParams;
 use codex_app_server_protocol::MarketplaceAddResponse;
@@ -142,6 +161,10 @@ use codex_app_server_protocol::PluginSource;
 use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::PluginUninstallResponse;
+use codex_app_server_protocol::RateLimitResetCredit;
+use codex_app_server_protocol::RateLimitResetCreditStatus;
+use codex_app_server_protocol::RateLimitResetCreditsSummary;
+use codex_app_server_protocol::RateLimitResetType;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery as ApiReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
@@ -166,13 +189,21 @@ use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
+use codex_app_server_protocol::ThreadBackgroundTerminal;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalsListParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateResponse;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadDecrementElicitationParams;
 use codex_app_server_protocol::ThreadDecrementElicitationResponse;
+use codex_app_server_protocol::ThreadDeleteParams;
+use codex_app_server_protocol::ThreadDeleteResponse;
+use codex_app_server_protocol::ThreadDeletedNotification;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadGoal;
@@ -186,11 +217,16 @@ use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadHistoryBuilder;
+#[cfg(test)]
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadIncrementElicitationParams;
 use codex_app_server_protocol::ThreadIncrementElicitationResponse;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadInjectItemsResponse;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemEntry;
+use codex_app_server_protocol::ThreadItemsListParams;
+use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
@@ -206,6 +242,8 @@ use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioResponse;
+use codex_app_server_protocol::ThreadRealtimeAppendSpeechParams;
+use codex_app_server_protocol::ThreadRealtimeAppendSpeechResponse;
 use codex_app_server_protocol::ThreadRealtimeAppendTextParams;
 use codex_app_server_protocol::ThreadRealtimeAppendTextResponse;
 use codex_app_server_protocol::ThreadRealtimeListVoicesResponse;
@@ -234,7 +272,6 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadStatus;
-use codex_app_server_protocol::ThreadTurnsItemsListParams;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::ThreadUnarchiveParams;
@@ -261,9 +298,19 @@ use codex_app_server_protocol::WindowsSandboxSetupCompletedNotification;
 use codex_app_server_protocol::WindowsSandboxSetupMode;
 use codex_app_server_protocol::WindowsSandboxSetupStartParams;
 use codex_app_server_protocol::WindowsSandboxSetupStartResponse;
+use codex_app_server_protocol::WorkspaceMessage;
+use codex_app_server_protocol::WorkspaceMessageType;
 use codex_arg0::Arg0DispatchPaths;
 use codex_backend_client::AddCreditsNudgeCreditType as BackendAddCreditsNudgeCreditType;
 use codex_backend_client::Client as BackendClient;
+use codex_backend_client::CodexWorkspaceMessage as BackendWorkspaceMessage;
+use codex_backend_client::CodexWorkspaceMessageType as BackendWorkspaceMessageType;
+use codex_backend_client::CodexWorkspaceMessagesResponse as BackendWorkspaceMessagesResponse;
+use codex_backend_client::ConsumeRateLimitResetCreditCode as BackendConsumeRateLimitResetCreditCode;
+use codex_backend_client::RateLimitResetCreditDetails as BackendRateLimitResetCreditDetails;
+use codex_backend_client::RateLimitResetCreditsDetails as BackendRateLimitResetCreditsDetails;
+use codex_backend_client::RequestError as BackendRequestError;
+use codex_backend_client::TokenUsageProfile;
 use codex_chatgpt::connectors;
 use codex_chatgpt::workspace_settings;
 use codex_config::CloudConfigBundleLoadError;
@@ -271,11 +318,11 @@ use codex_config::CloudConfigBundleLoadErrorCode;
 use codex_config::ConfigLayerStack;
 use codex_config::loader::project_trust_key;
 use codex_config::types::McpServerTransportConfig;
+use codex_connectors::AppInfo;
 use codex_core::CodexThread;
 use codex_core::CodexThreadSettingsOverrides;
-use codex_core::ExternalGoalPreviousStatus;
-use codex_core::ExternalGoalSet;
 use codex_core::ForkSnapshot;
+use codex_core::McpManager;
 use codex_core::NewThread;
 #[cfg(test)]
 use codex_core::SessionMeta;
@@ -297,18 +344,19 @@ use codex_core::path_utils;
 #[cfg(test)]
 use codex_core::read_head_for_summary;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_core::truncate_rollout_after_turn_id;
+use codex_core::truncate_rollout_before_turn_id;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_core::windows_sandbox::WindowsSandboxSetupMode as CoreWindowsSandboxSetupMode;
 use codex_core::windows_sandbox::WindowsSandboxSetupRequest;
 use codex_core::windows_sandbox::sandbox_setup_is_complete;
 use codex_core_plugins::PluginInstallError as CorePluginInstallError;
 use codex_core_plugins::PluginInstallRequest;
-use codex_core_plugins::PluginLoadOutcome;
 use codex_core_plugins::PluginReadRequest;
 use codex_core_plugins::PluginUninstallError as CorePluginUninstallError;
+use codex_core_plugins::PluginsManager;
 use codex_core_plugins::loader::load_plugin_apps;
 use codex_core_plugins::loader::load_plugin_mcp_servers;
-use codex_core_plugins::loader::plugin_telemetry_metadata_from_root;
 use codex_core_plugins::manifest::PluginManifestInterface;
 use codex_core_plugins::marketplace::MarketplaceError;
 use codex_core_plugins::marketplace::MarketplacePluginSource;
@@ -327,6 +375,8 @@ use codex_core_plugins::remote::RemotePluginShareContext as RemoteCatalogPluginS
 use codex_core_plugins::remote::RemotePluginShareSummary as RemoteCatalogPluginShareSummary;
 use codex_core_plugins::remote::RemotePluginSummary as RemoteCatalogPluginSummary;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::EnvironmentObservedStatus;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::LOCAL_FS;
 use codex_features::FEATURES;
 use codex_features::Feature;
@@ -337,24 +387,26 @@ use codex_feedback::FeedbackUploadOptions;
 use codex_git_utils::git_diff_to_remote;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_login::AuthManager;
-use codex_login::CLIENT_ID;
+use codex_login::CODEX_OPEN_APP_URL;
 use codex_login::CodexAuth;
+use codex_login::LoginSuccessPage;
+use codex_login::LoginSuccessPageBrand;
 use codex_login::ServerOptions as LoginServerOptions;
 use codex_login::ShutdownHandle;
-use codex_login::auth::login_with_chatgpt_auth_tokens;
 use codex_login::complete_device_code_login;
 use codex_login::login_with_api_key;
+use codex_login::login_with_bedrock_api_key;
+use codex_login::oauth_client_id;
 use codex_login::request_device_code;
 use codex_login::run_login_server;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::McpServerStatusSnapshot;
 use codex_mcp::McpSnapshotDetail;
 use codex_mcp::collect_mcp_server_status_snapshot_with_detail;
-use codex_mcp::discover_supported_scopes;
+use codex_mcp::discover_supported_scopes_with_http_client;
 use codex_mcp::read_mcp_resource as read_mcp_resource_without_thread;
 use codex_mcp::resolve_oauth_scopes;
 use codex_memories_write::clear_memory_roots_contents;
-use codex_model_provider::ProviderAccountError;
 use codex_model_provider::create_model_provider;
 use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use codex_protocol::ThreadId;
@@ -364,20 +416,17 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::WindowsSandboxLevel;
-use codex_protocol::dynamic_tools::DynamicToolSpec as CoreDynamicToolSpec;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::items::TurnItem;
-use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
-use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
-use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 #[cfg(test)]
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ConversationAudioParams;
+use codex_protocol::protocol::ConversationSpeechParams;
 use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::ConversationStartTransport;
 use codex_protocol::protocol::ConversationTextParams;
@@ -387,7 +436,6 @@ use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpAuthStatus as CoreMcpAuthStatus;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RealtimeVoicesList;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::ReviewDelivery as CoreReviewDelivery;
@@ -398,26 +446,35 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 #[cfg(test)]
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TurnEnvironmentSelection;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_protocol::protocol::strip_user_message_prefix;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_protocol::user_input::UserInput as CoreInputItem;
-use codex_rmcp_client::perform_oauth_login_return_url;
+use codex_rmcp_client::perform_oauth_login_return_url_with_http_client;
 use codex_rollout::is_persisted_rollout_item;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout::state_db::reconcile_rollout;
 use codex_state::ThreadMetadata;
 use codex_state::log_db::LogDbLayer;
 use codex_thread_store::ArchiveThreadParams as StoreArchiveThreadParams;
+use codex_thread_store::DeleteThreadParams as StoreDeleteThreadParams;
 use codex_thread_store::GitInfoPatch as StoreGitInfoPatch;
+use codex_thread_store::ListItemsParams as StoreListItemsParams;
 use codex_thread_store::ListThreadsParams as StoreListThreadsParams;
+use codex_thread_store::ListTurnsParams as StoreListTurnsParams;
+use codex_thread_store::LoadThreadHistoryParams as StoreLoadThreadHistoryParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::ReadThreadByRolloutPathParams as StoreReadThreadByRolloutPathParams;
 use codex_thread_store::ReadThreadParams as StoreReadThreadParams;
 use codex_thread_store::SearchThreadsParams as StoreSearchThreadsParams;
 use codex_thread_store::SortDirection as StoreSortDirection;
 use codex_thread_store::StoredThread;
+use codex_thread_store::StoredTurn;
+use codex_thread_store::StoredTurnItemsView;
+use codex_thread_store::StoredTurnStatus;
 use codex_thread_store::ThreadMetadataPatch as StoreThreadMetadataPatch;
+use codex_thread_store::ThreadRelationFilter as StoreThreadRelationFilter;
 use codex_thread_store::ThreadSortKey as StoreThreadSortKey;
 use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
@@ -454,11 +511,11 @@ use codex_app_server_protocol::ServerRequest;
 
 mod account_processor;
 mod apps_processor;
+mod bedrock_auth;
 mod catalog_processor;
 mod command_exec_processor;
 mod config_processor;
 mod environment_processor;
-mod external_agent_config_processor;
 mod feedback_doctor_report;
 mod feedback_processor;
 mod fs_processor;
@@ -470,6 +527,7 @@ mod plugins;
 mod process_exec_processor;
 mod remote_control_processor;
 mod search;
+mod thread_fork_goal;
 mod thread_processor;
 mod token_usage_replay;
 mod turn_processor;
@@ -481,7 +539,6 @@ pub(crate) use catalog_processor::CatalogRequestProcessor;
 pub(crate) use command_exec_processor::CommandExecRequestProcessor;
 pub(crate) use config_processor::ConfigRequestProcessor;
 pub(crate) use environment_processor::EnvironmentRequestProcessor;
-pub(crate) use external_agent_config_processor::ExternalAgentConfigRequestProcessor;
 pub(crate) use feedback_processor::FeedbackRequestProcessor;
 pub(crate) use fs_processor::FsRequestProcessor;
 pub(crate) use git_processor::GitRequestProcessor;
@@ -508,8 +565,76 @@ use crate::thread_state::ThreadStateManager;
 use token_usage_replay::latest_token_usage_turn_id_from_rollout_items;
 use token_usage_replay::send_thread_token_usage_update_to_connection;
 
+fn resolve_request_cwd(cwd: Option<PathBuf>) -> Result<Option<AbsolutePathBuf>, JSONRPCErrorError> {
+    cwd.map(|cwd| {
+        AbsolutePathBuf::relative_to_current_dir(path_utils::normalize_for_native_workdir(cwd))
+            .map_err(|err| invalid_request(format!("invalid cwd: {err}")))
+    })
+    .transpose()
+}
+
+fn resolve_turn_environment_selections(
+    thread_manager: &ThreadManager,
+    environments: Option<Vec<TurnEnvironmentParams>>,
+) -> Result<Option<Vec<TurnEnvironmentSelection>>, JSONRPCErrorError> {
+    let Some(environments) = environments else {
+        return Ok(None);
+    };
+    let mut selections = Vec::with_capacity(environments.len());
+    for environment in environments {
+        let environment_id = environment.environment_id;
+        let cwd = environment
+            .cwd
+            .to_inferred_path_uri()
+            .ok_or_else(|| {
+                invalid_request(format!(
+                    "invalid cwd for environment `{environment_id}`: path `{}` does not use absolute POSIX or Windows path syntax",
+                    environment.cwd
+                ))
+            })?;
+        let workspace_roots = environment
+            .runtime_workspace_roots
+            .map(|roots| {
+                let mut resolved_roots = Vec::new();
+                for root in roots {
+                    let root = root.to_inferred_path_uri().ok_or_else(|| {
+                        invalid_request(format!(
+                            "invalid runtime workspace root for environment `{environment_id}`: path `{root}` does not use absolute POSIX or Windows path syntax"
+                        ))
+                    })?;
+                    if !resolved_roots.contains(&root) {
+                        resolved_roots.push(root);
+                    }
+                }
+                Ok::<_, JSONRPCErrorError>(resolved_roots)
+            })
+            .transpose()?
+            .unwrap_or_else(|| vec![cwd.clone()]);
+        selections.push(TurnEnvironmentSelection {
+            environment_id,
+            cwd,
+            workspace_roots,
+        });
+    }
+    thread_manager
+        .validate_environment_selections(&selections)
+        .map_err(environment_selection_error)?;
+    Ok(Some(selections))
+}
+
+fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {
+    let mut resolved_roots = Vec::new();
+    for root in workspace_roots {
+        if !resolved_roots.iter().any(|existing| existing == &root) {
+            resolved_roots.push(root);
+        }
+    }
+    resolved_roots
+}
+
 mod config_errors;
 mod request_errors;
+mod thread_delete;
 mod thread_goal_processor;
 mod thread_lifecycle;
 mod thread_resume_redaction;
@@ -531,10 +656,10 @@ pub(crate) use self::thread_summary::summary_to_thread;
 pub(crate) use self::thread_summary::thread_settings_from_config_snapshot;
 pub(crate) use self::thread_summary::thread_settings_from_core_snapshot;
 
-pub(crate) fn build_api_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
+pub(crate) fn build_legacy_api_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
     let mut builder = ThreadHistoryBuilder::new();
     for item in items {
-        if is_persisted_rollout_item(item) {
+        if is_persisted_rollout_item(item, codex_protocol::protocol::ThreadHistoryMode::Legacy) {
             builder.handle_rollout_item(item);
         }
     }

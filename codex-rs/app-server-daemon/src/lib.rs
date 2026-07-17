@@ -15,6 +15,7 @@ use anyhow::anyhow;
 pub use backend::BackendKind;
 use backend::BackendPaths;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
+use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_transport::app_server_control_socket_path;
 use codex_utils_home_dir::find_codex_home;
 use managed_install::managed_codex_bin;
@@ -223,6 +224,13 @@ pub async fn enable_remote_control_on_socket(
         connect_retry_delay,
     )
     .await
+}
+
+/// Starts a manual pairing session through an already-running daemon app-server.
+pub async fn start_remote_control_pairing() -> Result<RemoteControlPairingStartResponse> {
+    ensure_supported_platform()?;
+    let daemon = Daemon::from_environment()?;
+    remote_control_client::start_pairing(&daemon.socket_path).await
 }
 
 pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControlOutput> {
@@ -543,6 +551,16 @@ impl Daemon {
             } else {
                 None
             };
+            if info.is_some() {
+                match mode {
+                    RemoteControlMode::Enabled => {
+                        remote_control_client::enable_remote_control(&self.socket_path).await?;
+                    }
+                    RemoteControlMode::Disabled => {
+                        remote_control_client::disable_remote_control(&self.socket_path).await?;
+                    }
+                }
+            }
             return Ok(self.remote_control_output(
                 already_remote_control_status(mode),
                 backend.map(|_| BackendKind::Pid),

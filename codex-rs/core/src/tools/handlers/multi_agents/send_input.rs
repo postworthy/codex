@@ -1,12 +1,10 @@
 use super::*;
 use crate::agent::control::render_input_preview;
 use crate::tools::handlers::multi_agents_spec::create_send_input_tool_v1;
-use crate::turn_timing::now_unix_timestamp_ms;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
 
-#[async_trait::async_trait]
 impl ToolExecutor<ToolInvocation> for Handler {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "send_input")
@@ -23,7 +21,13 @@ impl ToolExecutor<ToolInvocation> for Handler {
         )
     }
 
-    async fn handle(
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl Handler {
+    async fn handle_call(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
@@ -42,8 +46,17 @@ impl ToolExecutor<ToolInvocation> for Handler {
         let receiver_agent = session
             .services
             .agent_control
-            .get_agent_metadata(receiver_thread_id)
-            .unwrap_or_default();
+            .get_agent_metadata(receiver_thread_id);
+        if receiver_agent.is_some() {
+            let resume_config = build_agent_resume_config(turn.as_ref())?;
+            session
+                .services
+                .agent_control
+                .ensure_v2_agent_loaded(resume_config, receiver_thread_id)
+                .await
+                .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+        }
+        let receiver_agent = receiver_agent.unwrap_or_default();
         if args.interrupt {
             session
                 .services
@@ -53,16 +66,20 @@ impl ToolExecutor<ToolInvocation> for Handler {
                 .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
         }
         session
-            .send_event(
+            .emit_turn_item_started(
                 &turn,
-                CollabAgentInteractionBeginEvent {
-                    call_id: call_id.clone(),
-                    started_at_ms: now_unix_timestamp_ms(),
+                &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id.clone(),
+                    tool: CollabAgentTool::SendInput,
+                    status: CollabAgentToolCallStatus::InProgress,
                     sender_thread_id: session.thread_id,
-                    receiver_thread_id,
-                    prompt: prompt.clone(),
-                }
-                .into(),
+                    receiver_thread_ids: vec![receiver_thread_id],
+                    receiver_agents: Vec::new(),
+                    prompt: Some(prompt.clone()),
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: Default::default(),
+                }),
             )
             .await;
         let agent_control = session.services.agent_control.clone();
@@ -76,19 +93,24 @@ impl ToolExecutor<ToolInvocation> for Handler {
             .get_status(receiver_thread_id)
             .await;
         session
-            .send_event(
+            .emit_turn_item_completed(
                 &turn,
-                CollabAgentInteractionEndEvent {
-                    call_id,
-                    completed_at_ms: now_unix_timestamp_ms(),
+                TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id,
+                    tool: CollabAgentTool::SendInput,
+                    status: collab_tool_call_status(&status, Some(receiver_thread_id)),
                     sender_thread_id: session.thread_id,
-                    receiver_thread_id,
-                    receiver_agent_nickname: receiver_agent.agent_nickname,
-                    receiver_agent_role: receiver_agent.agent_role,
-                    prompt,
-                    status,
-                }
-                .into(),
+                    receiver_thread_ids: vec![receiver_thread_id],
+                    receiver_agents: vec![CollabAgentRef {
+                        thread_id: receiver_thread_id,
+                        agent_nickname: receiver_agent.agent_nickname,
+                        agent_role: receiver_agent.agent_role,
+                    }],
+                    prompt: Some(prompt),
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: [(receiver_thread_id, status)].into_iter().collect(),
+                }),
             )
             .await;
         let submission_id = result?;

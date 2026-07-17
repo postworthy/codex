@@ -3,6 +3,7 @@ use super::super::hooks::HookDirectoryField;
 use super::RequirementsCompositionError;
 use super::compose_requirements_for_hostname;
 use super::compose_requirements_for_hostname_and_hook_directory;
+use super::compose_requirements_with_hostname_resolver;
 use crate::ConfigRequirementsToml;
 use crate::ConfigRequirementsWithSources;
 use crate::RequirementSource;
@@ -10,7 +11,9 @@ use crate::Sourced;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use tempfile::TempDir;
 
 fn layer(id: &str, name: &str, contents: &str) -> RequirementsLayerEntry {
     RequirementsLayerEntry::from_toml(
@@ -62,6 +65,12 @@ fn top_level_values_use_toml_priority() {
             r#"
 allowed_approval_policies = ["on-request"]
 allowed_sandbox_modes = ["workspace-write"]
+default_permissions = ":workspace"
+allow_remote_control = true
+
+[allowed_permission_profiles]
+":read-only" = true
+":workspace" = true
 "#,
         ),
         layer(
@@ -70,6 +79,12 @@ allowed_sandbox_modes = ["workspace-write"]
             r#"
 allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
+default_permissions = ":read-only"
+allow_remote_control = false
+
+[allowed_permission_profiles]
+":danger-full-access" = false
+":workspace" = false
 "#,
         ),
     ])
@@ -82,6 +97,53 @@ allowed_sandbox_modes = ["read-only"]
             r#"
 allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
+default_permissions = ":read-only"
+allow_remote_control = false
+
+[allowed_permission_profiles]
+":danger-full-access" = false
+":read-only" = true
+":workspace" = false
+"#
+        )
+    );
+}
+
+#[test]
+fn new_thread_model_defaults_use_toml_priority() {
+    let composed = compose(vec![
+        layer(
+            "req_low",
+            "Low",
+            r#"
+[models.new_thread]
+model = "low-priority-model"
+model_reasoning_effort = "low"
+service_tier = "flex"
+"#,
+        ),
+        layer(
+            "req_high",
+            "High",
+            r#"
+[models.new_thread]
+model = "high-priority-model"
+model_reasoning_effort = "high"
+service_tier = "fast"
+"#,
+        ),
+    ])
+    .expect("compose requirements")
+    .expect("requirements present");
+
+    assert_eq!(
+        composed,
+        expected_requirements(
+            r#"
+[models.new_thread]
+model = "high-priority-model"
+model_reasoning_effort = "high"
+service_tier = "fast"
 "#
         )
     );
@@ -119,6 +181,7 @@ fn composition_strategy_applies_to_non_cloud_layers() {
                 format!(
                     r#"
 allowed_approval_policies = ["on-request"]
+allow_remote_control = true
 
 [features]
 shared = false
@@ -138,6 +201,7 @@ deny_read = [{low_path:?}]
                 format!(
                     r#"
 allowed_approval_policies = ["never"]
+allow_remote_control = false
 
 [features]
 shared = true
@@ -162,6 +226,7 @@ deny_read = [{high_path:?}]
         expected_requirements(format!(
             r#"
 allowed_approval_policies = ["never"]
+allow_remote_control = false
 
 [features]
 shared = true
@@ -182,7 +247,14 @@ deny_read = [{high_path:?}, {low_path:?}]
     );
     assert_eq!(
         composed.allowed_approval_policies,
-        Some(Sourced::new(vec![AskForApproval::Never], mdm_source))
+        Some(Sourced::new(
+            vec![AskForApproval::Never],
+            mdm_source.clone()
+        ))
+    );
+    assert_eq!(
+        composed.allow_remote_control,
+        Some(Sourced::new(/*value*/ false, mdm_source))
     );
 }
 
@@ -518,6 +590,81 @@ allowed_sandbox_modes = ["workspace-write"]
         expected_requirements(
             r#"
 allowed_sandbox_modes = ["read-only"]
+"#
+        )
+    );
+}
+
+#[test]
+fn hostname_resolver_is_not_called_without_remote_sandbox_config() {
+    let calls = Cell::<usize>::default();
+    let composed = compose_requirements_with_hostname_resolver(
+        vec![layer(
+            "req",
+            "No remote selector",
+            r#"
+allowed_sandbox_modes = ["read-only"]
+"#,
+        )],
+        || {
+            calls.set(calls.get() + 1);
+            Some("build-01.example.com".to_string())
+        },
+    )
+    .expect("compose requirements")
+    .expect("requirements present")
+    .into_toml();
+
+    assert_eq!(calls.get(), 0);
+    assert_eq!(
+        composed,
+        expected_requirements(
+            r#"
+allowed_sandbox_modes = ["read-only"]
+"#
+        )
+    );
+}
+
+#[test]
+fn hostname_resolver_is_called_once_for_multiple_remote_sandbox_layers() {
+    let calls = Cell::<usize>::default();
+    let composed = compose_requirements_with_hostname_resolver(
+        vec![
+            layer(
+                "req_low",
+                "Low",
+                r#"
+[[remote_sandbox_config]]
+hostname_patterns = ["build-*.example.com"]
+allowed_sandbox_modes = ["read-only"]
+"#,
+            ),
+            layer(
+                "req_high",
+                "High",
+                r#"
+[[remote_sandbox_config]]
+hostname_patterns = ["build-*.example.com"]
+allowed_sandbox_modes = ["workspace-write"]
+"#,
+            ),
+        ],
+        || {
+            calls.set(calls.get() + 1);
+            Some("build-01.example.com".to_string())
+        },
+    )
+    .expect("compose requirements")
+    .expect("requirements present")
+    .into_toml();
+
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        composed,
+        expected_requirements(
+            r#"
+allowed_sandbox_modes = ["workspace-write"]
 "#
         )
     );
@@ -919,4 +1066,155 @@ fn parse_error_names_layer() {
 
     assert!(err.to_string().contains("Bad layer (req_bad)"));
     assert!(err.to_string().contains("allowed_approval_policies"));
+}
+
+#[test]
+fn marketplace_allowed_sources_use_default_toml_merge() {
+    let composed = compose(vec![
+        layer(
+            "req_low",
+            "Low",
+            r#"
+[marketplaces]
+restrict_to_allowed_sources = true
+
+[marketplaces.allowed_sources.shared]
+source = "git"
+url = "https://github.com/example/old.git"
+ref = "main"
+
+[marketplaces.allowed_sources.other]
+source = "git"
+url = "https://github.com/example/other.git"
+"#,
+        ),
+        layer(
+            "req_high",
+            "High",
+            r#"
+[marketplaces.allowed_sources.shared]
+ref = "release"
+"#,
+        ),
+    ])
+    .expect("compose requirements")
+    .expect("requirements present");
+
+    assert_eq!(
+        composed,
+        expected_requirements(
+            r#"
+[marketplaces]
+restrict_to_allowed_sources = true
+
+[marketplaces.allowed_sources.shared]
+source = "git"
+url = "https://github.com/example/old.git"
+ref = "release"
+
+[marketplaces.allowed_sources.other]
+source = "git"
+url = "https://github.com/example/other.git"
+"#,
+        )
+    );
+}
+
+#[test]
+fn marketplace_source_switch_uses_default_toml_merge() {
+    let composed = compose(vec![
+        layer(
+            "req_low",
+            "Low",
+            r#"
+[marketplaces.allowed_sources.company]
+source = "git"
+url = "https://github.com/example/plugins.git"
+ref = "main"
+"#,
+        ),
+        layer(
+            "req_high",
+            "High",
+            r#"
+[marketplaces.allowed_sources.company]
+source = "host_pattern"
+host_pattern = '^github\.example\.com$'
+"#,
+        ),
+    ])
+    .expect("compose requirements")
+    .expect("requirements present");
+
+    assert_eq!(
+        composed,
+        expected_requirements(
+            r#"
+[marketplaces.allowed_sources.company]
+source = "host_pattern"
+url = "https://github.com/example/plugins.git"
+ref = "main"
+host_pattern = '^github\.example\.com$'
+"#,
+        )
+    );
+}
+
+#[test]
+fn marketplace_allowed_source_rejects_unknown_fields() {
+    let err = compose(vec![layer(
+        "req_bad",
+        "Bad marketplace layer",
+        r#"
+[marketplaces]
+restrict_to_allowed_sources = true
+
+[marketplaces.allowed_sources.invalid]
+source = "git"
+url = "https://github.com/example/plugins.git"
+reff = "main"
+"#,
+    )])
+    .expect_err("invalid marketplace rule should fail");
+
+    assert!(err.to_string().contains("Bad marketplace layer (req_bad)"));
+    assert!(err.to_string().contains("unknown field `reff`"));
+}
+
+#[test]
+fn local_marketplace_path_is_not_resolved_during_requirements_merge() {
+    let base_dir = TempDir::new().expect("create requirements base directory");
+    let base_dir = AbsolutePathBuf::try_from(base_dir.path().to_path_buf())
+        .expect("absolute requirements base directory");
+    let composed = compose(vec![
+        layer(
+            "req_local",
+            "Local marketplace path",
+            r#"
+[marketplaces]
+restrict_to_allowed_sources = true
+
+[marketplaces.allowed_sources.local]
+source = "local"
+path = "../plugins"
+"#,
+        )
+        .with_base_dir(base_dir),
+    ])
+    .expect("compose requirements")
+    .expect("requirements present");
+
+    assert_eq!(
+        composed,
+        expected_requirements(
+            r#"
+[marketplaces]
+restrict_to_allowed_sources = true
+
+[marketplaces.allowed_sources.local]
+source = "local"
+path = "../plugins"
+"#,
+        )
+    );
 }

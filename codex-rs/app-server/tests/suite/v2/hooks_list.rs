@@ -25,7 +25,8 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_core::config::set_project_trust_level;
 use codex_protocol::config_types::TrustLevel;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use core_test_support::skip_if_windows;
+use core_test_support::skip_if_host_windows;
+use core_test_support::skip_if_remote;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use tempfile::TempDir;
@@ -135,7 +136,10 @@ async fn hooks_list_shows_discovered_hook() -> Result<()> {
     let cwd = TempDir::new()?;
     write_user_hook_config(codex_home.path())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -211,7 +215,11 @@ async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
 }"#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -265,12 +273,97 @@ async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
 }
 
 #[tokio::test]
+async fn hooks_list_warms_plugin_capabilities_for_thread_start() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
+    write_plugin_hook_config(
+        codex_home.path(),
+        r#"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo plugin hook"
+          }
+        ]
+      }
+    ]
+  }
+}"#,
+    )?;
+    let plugin_mcp_path = codex_home
+        .path()
+        .join("plugins/cache/test/demo/local/.mcp.json");
+    std::fs::write(
+        &plugin_mcp_path,
+        r#"{
+  "mcpServers": {
+    "plugin-server": {
+      "url": "http://127.0.0.1:1/mcp"
+    }
+  }
+}"#,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let hooks_list_id = mcp
+        .send_hooks_list_request(HooksListParams {
+            cwds: vec![cwd.path().to_path_buf()],
+        })
+        .await?;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(hooks_list_id)),
+    )
+    .await??;
+
+    std::fs::remove_file(plugin_mcp_path)?;
+
+    let thread_start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let _: ThreadStartResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
+        )
+        .await??,
+    )?;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_matching_notification("plugin MCP server starting", |notification| {
+            notification.method == "mcpServer/startupStatus/updated"
+                && notification
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("plugin-server")
+        }),
+    )
+    .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn hooks_list_shows_plugin_hook_load_warnings() -> Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
     write_plugin_hook_config(codex_home.path(), "{ not-json")?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -326,7 +419,11 @@ timeout = 5
     )?;
     set_project_trust_level(codex_home.path(), workspace.path(), TrustLevel::Trusted)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -408,7 +505,11 @@ async fn hooks_list_uses_root_repo_hooks_for_linked_worktrees() -> Result<()> {
     write_project_hook_config(&worktree_root.join(".codex"), "echo worktree hook")?;
     set_project_trust_level(codex_home.path(), &repo_root, TrustLevel::Trusted)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let list_id = mcp
@@ -478,7 +579,11 @@ async fn config_batch_write_toggles_user_hook() -> Result<()> {
     let cwd = TempDir::new()?;
     write_user_hook_config(codex_home.path())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -573,7 +678,9 @@ async fn config_batch_write_toggles_user_hook() -> Result<()> {
 
 #[tokio::test]
 async fn config_batch_write_updates_hook_trust_for_loaded_session() -> Result<()> {
-    skip_if_windows!(Ok(()));
+    skip_if_host_windows!(Ok(()));
+    // TODO(anp): Teach command-hook fixtures to run in selected remote environments.
+    skip_if_remote!(Ok(()), "command hooks use host-local script and log paths");
 
     let responses = vec![
         create_final_assistant_message_sse_response("Warmup")?,
@@ -629,7 +736,10 @@ command = "python3 {hook_script_path}"
         ),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let hook_list_id = mcp
@@ -647,7 +757,7 @@ command = "python3 {hook_script_path}"
     assert_eq!(hook.trust_status, HookTrustStatus::Untrusted);
 
     let thread_start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
@@ -824,7 +934,9 @@ command = "python3 {hook_script_path}"
 
 #[tokio::test]
 async fn config_batch_write_disables_hook_for_loaded_session() -> Result<()> {
-    skip_if_windows!(Ok(()));
+    skip_if_host_windows!(Ok(()));
+    // TODO(anp): Teach command-hook fixtures to run in selected remote environments.
+    skip_if_remote!(Ok(()), "command hooks use host-local script and log paths");
 
     let responses = vec![
         create_final_assistant_message_sse_response("Warmup")?,
@@ -879,7 +991,10 @@ command = "python3 {hook_script_path}"
         ),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let hook_list_id = mcp
@@ -920,7 +1035,7 @@ command = "python3 {hook_script_path}"
     let _: codex_app_server_protocol::ConfigWriteResponse = to_response(response)?;
 
     let thread_start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             ..Default::default()
         })

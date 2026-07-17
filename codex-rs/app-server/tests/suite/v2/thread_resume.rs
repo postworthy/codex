@@ -2,6 +2,7 @@ use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
 use app_test_support::create_apply_patch_sse_response;
+use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_fake_rollout_with_token_usage;
@@ -14,6 +15,7 @@ use app_test_support::test_absolute_path;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use chrono::Utc;
+use codex_app_server_protocol::ApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
@@ -23,6 +25,7 @@ use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::McpToolCallAppContext;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
 use codex_app_server_protocol::RequestId;
@@ -32,7 +35,9 @@ use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadGoalClearResponse;
 use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadReadParams;
@@ -40,6 +45,8 @@ use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadResumeInitialTurnsPageParams;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
+use codex_app_server_protocol::ThreadSettingsUpdateParams;
+use codex_app_server_protocol::ThreadSettingsUpdateResponse;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -54,10 +61,14 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::Settings;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ImageGenerationEndEvent;
@@ -80,8 +91,11 @@ use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::read_session_meta_line;
 use codex_state::StateRuntime;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_remote;
+use core_test_support::skip_if_wine_exec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::fs::FileTimes;
@@ -103,12 +117,99 @@ use super::analytics::assert_basic_thread_initialized_event;
 use super::analytics::mount_analytics_capture;
 use super::analytics::thread_initialized_event;
 use super::analytics::wait_for_analytics_payload;
+use super::analytics::wait_for_goal_event;
+use super::analytics::wait_for_matching_analytics_event;
 
 #[cfg(windows)]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
+
+#[tokio::test]
+async fn thread_resume_paginated_uses_model_context_without_history() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
+
+    let full_resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let full_resume_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_error_message(RequestId::Integer(full_resume_id)),
+    )
+    .await??;
+    assert_eq!(full_resume_err.error.code, -32600);
+    assert_eq!(
+        full_resume_err.error.message,
+        "paginated threads do not support full-history thread/resume; pass excludeTurns=true"
+    );
+
+    let initial_page_resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            exclude_turns: true,
+            initial_turns_page: Some(ThreadResumeInitialTurnsPageParams {
+                limit: None,
+                sort_direction: None,
+                items_view: None,
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let initial_page_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_error_message(RequestId::Integer(initial_page_resume_id)),
+    )
+    .await??;
+    assert_eq!(initial_page_err.error.code, -32600);
+    assert_eq!(
+        initial_page_err.error.message,
+        "paginated threads do not support initialTurnsPage; use turnsBackwardsCursor and itemsBackwardsCursor"
+    );
+
+    // LocalThreadStore rejects paginated full-history reads, so this cold resume only succeeds
+    // when app-server asks for the bounded latest model context.
+    let resume_id = primary
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(resumed.id, conversation_id);
+    assert_eq!(resumed.history_mode, ThreadHistoryMode::Paginated);
+    assert!(resumed.turns.is_empty());
+
+    Ok(())
+}
 
 fn normalized_existing_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(AbsolutePathBuf::from_absolute_path(path.as_ref().canonicalize()?)?.into_path_buf())
@@ -150,12 +251,15 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     // Start a thread.
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -197,11 +301,14 @@ async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -257,6 +364,93 @@ async fn thread_resume_with_empty_path_uses_running_thread_id() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_resume_running_thread_uses_cached_instruction_sources() -> Result<()> {
+    skip_if_remote!(
+        Ok(()),
+        "cached instruction-source fixture is outside the selected remote cwd"
+    );
+
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let workspace = TempDir::new()?;
+    let project_agents = workspace.path().join("AGENTS.md");
+    std::fs::write(&project_agents, "project instructions")?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        // TODO(anp): Move the cached instruction-source fixture into the auto environment cwd.
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            cwd: Some(workspace.path().display().to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse {
+        thread,
+        instruction_sources,
+        ..
+    } = to_response::<ThreadStartResponse>(start_resp)?;
+    let project_agents = AbsolutePathBuf::try_from(project_agents)?;
+    let project_agents_source = LegacyAppPathString::from_abs_path(&project_agents);
+    assert_eq!(instruction_sources, vec![project_agents_source.clone()]);
+
+    let turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "materialize rollout".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    std::fs::remove_file(project_agents.as_path())?;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        instruction_sources,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(instruction_sources, vec![project_agents_source]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -266,11 +460,14 @@ async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Resul
     let extra_root = extra_root_tmp.path().join("extra-root");
     std::fs::create_dir_all(&extra_root)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -290,7 +487,10 @@ async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Resul
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
             }],
-            runtime_workspace_roots: Some(vec![extra_root.clone(), extra_root.join(".")]),
+            runtime_workspace_roots: Some(vec![
+                AbsolutePathBuf::from_absolute_path(&extra_root)?,
+                AbsolutePathBuf::from_absolute_path(extra_root.join("."))?,
+            ]),
             ..Default::default()
         })
         .await?;
@@ -331,6 +531,256 @@ async fn turn_start_updates_runtime_workspace_roots_for_loaded_thread() -> Resul
 }
 
 #[tokio::test]
+async fn thread_resume_preserves_persisted_approvals_reviewer() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let thread_id = {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .without_auto_env()
+            .build()
+            .await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+        let start_id = mcp
+            .send_thread_start_request(ThreadStartParams {
+                model: Some("gpt-5.4".to_string()),
+                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                ..Default::default()
+            })
+            .await?;
+        let start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+        )
+        .await??;
+        let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+        let turn_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![UserInput::Text {
+                    text: "materialize this thread".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+        )
+        .await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+
+        thread.id
+    };
+
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        config_path,
+        config.replace(
+            "approval_policy = \"never\"\n",
+            "approval_policy = \"never\"\napprovals_reviewer = \"user\"\n",
+        ),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        approvals_reviewer, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_preserves_acknowledged_model_effort_and_approvals_reviewer_update()
+-> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let config_path = codex_home.path().join("config.toml");
+    let config_toml = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config_toml.replace(
+            "model = \"gpt-5.4\"",
+            "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"",
+        ),
+    )?;
+
+    let thread_id = {
+        let mut mcp = TestAppServer::builder()
+            .with_codex_home(codex_home.path())
+            .build()
+            .await?;
+        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+        let start_id = mcp
+            .send_thread_start_request_with_auto_env(ThreadStartParams {
+                model: Some("gpt-5.4".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let start_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+        )
+        .await??;
+        let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+        let turn_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![UserInput::Text {
+                    text: "materialize this thread".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+        )
+        .await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+
+        let update_id = mcp
+            .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+                thread_id: thread.id.clone(),
+                model: Some("gpt-5.2-codex".to_string()),
+                effort: Some(ReasoningEffort::Ultra),
+                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                ..Default::default()
+            })
+            .await?;
+        let update_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(update_id)),
+        )
+        .await??;
+        let _: ThreadSettingsUpdateResponse = to_response(update_resp)?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/settings/updated"),
+        )
+        .await??;
+
+        thread.id
+    };
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        model,
+        reasoning_effort,
+        approvals_reviewer,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(model, "gpt-5.2-codex");
+    assert_eq!(reasoning_effort, Some(ReasoningEffort::Ultra));
+    assert_eq!(approvals_reviewer, ApprovalsReviewer::AutoReview);
+
+    let update_id = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: thread_id.clone(),
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: "gpt-5.2-codex".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
+            ..Default::default()
+        })
+        .await?;
+    let update_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(update_id)),
+    )
+    .await??;
+    let _: ThreadSettingsUpdateResponse = to_response(update_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+    drop(mcp);
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        reasoning_effort, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    assert_eq!(reasoning_effort, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -342,11 +792,15 @@ async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
 
-    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.2-codex".to_string()),
             ephemeral: Some(true),
             ..Default::default()
@@ -385,6 +839,96 @@ async fn thread_goal_get_rejects_unmaterialized_thread() -> Result<()> {
 }
 
 #[tokio::test]
+async fn goal_first_live_thread_appears_in_state_db_thread_list() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let codex_home_path = normalized_existing_path(codex_home.path())?;
+    create_config_toml(&codex_home_path, &server.uri())?;
+    let config_path = codex_home_path.join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        config.replace("personality = true\n", "personality = true\ngoals = true\n"),
+    )?;
+
+    let sqlite_home = codex_home_path
+        .as_path()
+        .to_str()
+        .expect("test codex home should be utf-8");
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home_path)
+        .without_managed_config()
+        .with_env_overrides(&[("CODEX_SQLITE_HOME", Some(sqlite_home))])
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("gpt-5.2-codex".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, cwd, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let goal_id = mcp
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({
+                "threadId": thread.id.clone(),
+                "objective": "keep the goal-first thread visible",
+                "status": "paused",
+            })),
+        )
+        .await?;
+    let goal_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(goal_id)),
+    )
+    .await??;
+    let _goal: ThreadGoalSetResponse = to_response(goal_resp)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/goal/updated"),
+    )
+    .await??;
+
+    let list_id = mcp
+        .send_raw_request(
+            "thread/list",
+            Some(json!({
+                "limit": 10,
+                "modelProviders": ["mock_provider"],
+                "sourceKinds": ["vscode"],
+                "archived": false,
+                "cwd": cwd.as_path().to_string_lossy().to_string(),
+                "useStateDbOnly": true,
+            })),
+        )
+        .await?;
+    let list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    let list: ThreadListResponse = to_response(list_resp)?;
+    assert_eq!(
+        list.data
+            .iter()
+            .map(|thread| &thread.id)
+            .collect::<Vec<_>>(),
+        vec![&thread.id]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
@@ -400,14 +944,19 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
-    set_thread_source_on_fake_rollout(
+    set_session_meta_on_fake_rollout(
         codex_home.path(),
         "2025-01-05T12-00-00",
         &conversation_id,
         "user",
+        "codex_work_desktop",
     )?;
 
-    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -434,7 +983,8 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
         event,
         &thread.id,
         &thread.session_id,
-        "gpt-5.3-codex",
+        "codex_work_desktop",
+        "gpt-5.4",
         "resumed",
         "user",
     );
@@ -442,11 +992,98 @@ async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
     Ok(())
 }
 
-fn set_thread_source_on_fake_rollout(
+#[tokio::test]
+async fn thread_resume_running_thread_tracks_thread_originator_in_analytics() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            thread_source: Some(ThreadSource::User),
+            service_name: Some("codex_work_desktop".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            client_user_message_id: None,
+            input: vec![UserInput::Text {
+                text: "materialize rollout".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    let event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+        event["event_type"] == "codex_thread_initialized"
+            && event["event_params"]["thread_id"] == resumed.id
+            && event["event_params"]["initialization_mode"] == "resumed"
+    })
+    .await?;
+    assert_basic_thread_initialized_event(
+        &event,
+        &resumed.id,
+        &resumed.session_id,
+        "codex_work_desktop",
+        "mock-model",
+        "resumed",
+        "user",
+    );
+    Ok(())
+}
+
+fn set_session_meta_on_fake_rollout(
     codex_home: &std::path::Path,
     filename_ts: &str,
     thread_id: &str,
     thread_source: &str,
+    originator: &str,
 ) -> Result<()> {
     let path = rollout_path(codex_home, filename_ts, thread_id);
     let contents = std::fs::read_to_string(&path)?;
@@ -456,6 +1093,7 @@ fn set_thread_source_on_fake_rollout(
         .ok_or_else(|| anyhow::anyhow!("fake rollout missing session meta"))?;
     let mut session_meta: serde_json::Value = serde_json::from_str(session_meta)?;
     session_meta["payload"]["thread_source"] = serde_json::json!(thread_source);
+    session_meta["payload"]["originator"] = serde_json::json!(originator);
     let remaining = lines.collect::<Vec<_>>().join("\n");
     std::fs::write(&path, format!("{session_meta}\n{remaining}\n"))?;
     Ok(())
@@ -485,7 +1123,10 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
         /*git_info*/ None,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -559,6 +1200,7 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
                 .expect("remote resume should include redacted MCP item");
             let ThreadItem::McpToolCall {
                 arguments,
+                app_context,
                 result,
                 error,
                 ..
@@ -567,6 +1209,16 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
                 unreachable!("matched MCP item");
             };
             assert_eq!(arguments, &json!("[redacted]"));
+            assert_eq!(
+                app_context,
+                &Some(McpToolCallAppContext {
+                    connector_id: "calendar".to_string(),
+                    link_id: Some("link_calendar".to_string()),
+                    resource_uri: Some("ui://widget/lookup.html".to_string()),
+                    app_name: Some("Calendar".to_string()),
+                    action_name: Some("lookup".to_string()),
+                })
+            );
             let result = result.as_ref().expect("redacted MCP result");
             assert_eq!(
                 result.content,
@@ -582,7 +1234,7 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
                 !remote_turn
                     .items
                     .iter()
-                    .any(|item| matches!(item, ThreadItem::ImageGeneration { .. })),
+                    .any(|item| matches!(item, ThreadItem::ImageGeneration(_))),
                 "remote resume should drop image generation items for {client_name}"
             );
         }
@@ -600,12 +1252,25 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
         .find(|item| matches!(item, ThreadItem::McpToolCall { .. }))
         .expect("normal resume should include MCP item");
     let ThreadItem::McpToolCall {
-        arguments, result, ..
+        arguments,
+        app_context,
+        result,
+        ..
     } = normal_mcp_item
     else {
         unreachable!("matched MCP item");
     };
     assert_eq!(arguments, &json!({"secret":"argument"}));
+    assert_eq!(
+        app_context,
+        &Some(McpToolCallAppContext {
+            connector_id: "calendar".to_string(),
+            link_id: Some("link_calendar".to_string()),
+            resource_uri: Some("ui://widget/lookup.html".to_string()),
+            app_name: Some("Calendar".to_string()),
+            action_name: Some("lookup".to_string()),
+        })
+    );
     let result = result.as_ref().expect("normal MCP result");
     assert_eq!(
         result.content,
@@ -622,12 +1287,9 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
     assert!(
         normal_turn.items.iter().any(|item| matches!(
             item,
-            ThreadItem::ImageGeneration {
-                result,
-                revised_prompt,
-                ..
-            } if result == "base64-image-result"
-                && revised_prompt.as_deref() == Some("secret revised prompt")
+            ThreadItem::ImageGeneration(item)
+                if item.result == "base64-image-result"
+                    && item.revised_prompt.as_deref() == Some("secret revised prompt")
         )),
         "normal resume should keep image generation items"
     );
@@ -657,7 +1319,10 @@ async fn resume_redaction_fixture(client_name: Option<&str>) -> Result<ThreadRes
         &conversation_id,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     if let Some(client_name) = client_name {
         let _ = timeout(
             DEFAULT_READ_TIMEOUT,
@@ -707,7 +1372,11 @@ fn append_resume_redaction_history(
                 tool: "lookup".to_string(),
                 arguments: Some(json!({"secret":"argument"})),
             },
+            connector_id: Some("calendar".to_string()),
             mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
+            link_id: Some("link_calendar".to_string()),
+            app_name: Some("Calendar".to_string()),
+            action_name: Some("lookup".to_string()),
             plugin_id: None,
             duration: Duration::from_millis(8),
             result: Ok(CallToolResult {
@@ -762,7 +1431,10 @@ async fn thread_resume_can_skip_turns_for_metadata_only_resume() -> Result<()> {
         /*git_info*/ None,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -809,7 +1481,10 @@ async fn thread_resume_rejects_archived_session_by_id() -> Result<()> {
         archived_dir.join(active_rollout_path.file_name().expect("rollout file name")),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -848,11 +1523,15 @@ async fn thread_resume_keeps_paused_goal_paused() -> Result<()> {
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
 
-    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.2-codex".to_string()),
             ..Default::default()
         })
@@ -953,11 +1632,15 @@ async fn thread_goal_set_preserves_budget_limited_same_objective() -> Result<()>
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
 
-    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.2-codex".to_string()),
             ..Default::default()
         })
@@ -1052,11 +1735,15 @@ async fn thread_goal_set_persists_resumable_stopped_statuses() -> Result<()> {
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
 
-    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.2-codex".to_string()),
             ..Default::default()
         })
@@ -1147,7 +1834,11 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
         /*git_info*/ None,
     )?;
 
-    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let goal_id = mcp
@@ -1237,22 +1928,37 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
 }
 
 #[tokio::test]
-async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
-    let server = create_mock_responses_server_repeating_assistant("Done").await;
+async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        responses::sse(vec![
+            responses::ev_response_created("materialize-thread"),
+            responses::ev_completed("materialize-thread"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("goal-continuation"),
+            responses::ev_completed_with_tokens("goal-continuation", /*total_tokens*/ 200),
+        ]),
+    ])
+    .await;
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    create_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
     let config_path = codex_home.path().join("config.toml");
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
         config.replace("personality = true\n", "personality = true\ngoals = true\n"),
     )?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
-    let mut mcp = TestAppServer::new_without_managed_config(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT.saturating_mul(2), mcp.initialize()).await??;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.2-codex".to_string()),
             ..Default::default()
         })
@@ -1291,7 +1997,8 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
             "thread/goal/set",
             Some(json!({
                 "threadId": thread.id,
-                "objective": "keep polishing",
+                "objective": "do not serialize this objective",
+                "tokenBudget": 100,
             })),
         )
         .await?;
@@ -1306,6 +2013,55 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
         mcp.read_stream_until_notification_message("thread/goal/updated"),
     )
     .await??;
+
+    let created = wait_for_goal_event(&server, DEFAULT_READ_TIMEOUT, "created", "active").await?;
+    let persisted_goal_id = created["event_params"]["goal_id"]
+        .as_str()
+        .expect("created goal id");
+    assert_eq!(created["event_params"]["thread_id"], thread.id);
+    assert_eq!(created["event_params"]["turn_id"], serde_json::Value::Null);
+    assert_eq!(created["event_params"]["has_token_budget"], true);
+    assert!(created["event_params"]["session_id"].is_string());
+    assert!(created["event_params"]["app_server_client"].is_object());
+    assert!(created["event_params"]["runtime"].is_object());
+    assert!(created["event_params"].get("objective").is_none());
+    assert!(created["event_params"].get("token_budget").is_none());
+
+    let usage = wait_for_goal_event(
+        &server,
+        DEFAULT_READ_TIMEOUT,
+        "usage_accounted",
+        "budget_limited",
+    )
+    .await?;
+    let causal_turn_id = usage["event_params"]["turn_id"]
+        .as_str()
+        .expect("accounted usage turn id");
+    assert_eq!(usage["event_params"]["goal_id"], persisted_goal_id);
+    assert_eq!(usage["event_params"]["cumulative_tokens_accounted"], 200);
+    assert!(
+        usage["event_params"]["cumulative_time_accounted_seconds"]
+            .as_i64()
+            .is_some()
+    );
+
+    let status = wait_for_goal_event(
+        &server,
+        DEFAULT_READ_TIMEOUT,
+        "status_changed",
+        "budget_limited",
+    )
+    .await?;
+    assert_eq!(status["event_params"]["goal_id"], persisted_goal_id);
+    assert_eq!(status["event_params"]["turn_id"], causal_turn_id);
+    assert_eq!(
+        status["event_params"]["cumulative_tokens_accounted"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        status["event_params"]["cumulative_time_accounted_seconds"],
+        serde_json::Value::Null
+    );
 
     let clear_id = mcp
         .send_raw_request(
@@ -1328,6 +2084,11 @@ async fn thread_goal_clear_deletes_goal_and_notifies() -> Result<()> {
         mcp.read_stream_until_notification_message("thread/goal/cleared"),
     )
     .await??;
+
+    let cleared =
+        wait_for_goal_event(&server, DEFAULT_READ_TIMEOUT, "cleared", "budget_limited").await?;
+    assert_eq!(cleared["event_params"]["goal_id"], persisted_goal_id);
+    assert_eq!(cleared["event_params"]["turn_id"], serde_json::Value::Null);
 
     let get_id = mcp
         .send_raw_request(
@@ -1378,7 +2139,10 @@ async fn thread_resume_emits_restored_token_usage_before_next_turn() -> Result<(
         Some("mock_provider"),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -1431,7 +2195,10 @@ async fn thread_resume_skips_restored_token_usage_when_turns_are_excluded() -> R
         Some("mock_provider"),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let first_resume_id = mcp
@@ -1539,7 +2306,10 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
         format!("{persisted_rollout}{appended_rollout}\n"),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -1628,6 +2398,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                     total_token_usage: TokenUsage {
                         input_tokens: 180,
                         cached_input_tokens: 40,
+                        cache_write_input_tokens: 0,
                         output_tokens: 50,
                         reasoning_output_tokens: 15,
                         total_tokens: 230,
@@ -1635,6 +2406,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                     last_token_usage: TokenUsage {
                         input_tokens: 90,
                         cached_input_tokens: 30,
+                        cache_write_input_tokens: 0,
                         output_tokens: 40,
                         reasoning_output_tokens: 12,
                         total_tokens: 130,
@@ -1650,6 +2422,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(interrupted_turn_id.to_string()),
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
@@ -1663,7 +2436,10 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
         format!("{persisted_rollout}{appended_rollout}\n"),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -1711,7 +2487,7 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
         &config_toml,
         format!(
             r#"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 approval_policy = "never"
 sandbox_mode = "read-only"
 
@@ -1793,6 +2569,7 @@ stream_max_retries = 0
     let rollout_dir = rollout_path.parent().expect("rollout parent directory");
     std::fs::create_dir_all(rollout_dir)?;
     let session_meta = SessionMeta {
+        session_id: conversation_id.into(),
         id: conversation_id,
         forked_from_id: None,
         parent_thread_id: None,
@@ -1808,8 +2585,12 @@ stream_max_retries = 0
         model_provider: Some("mock_provider".to_string()),
         base_instructions: None,
         dynamic_tools: None,
+        selected_capability_roots: Vec::new(),
         memory_mode: None,
+        history_mode: Default::default(),
+        subagent_history_start_ordinal: None,
         multi_agent_version: None,
+        context_window: None,
     };
     std::fs::write(
         &rollout_path,
@@ -1853,7 +2634,10 @@ stream_max_retries = 0
         .mark_backfill_complete(/*last_watermark*/ None)
         .await?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let update_id = mcp
@@ -1947,7 +2731,10 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
         format!("{persisted_rollout}{appended_rollout}\n"),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -2021,7 +2808,10 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
     let rollout = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
     let thread_id = rollout.conversation_id.clone();
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let read_id = mcp
@@ -2054,6 +2844,7 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
     let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
 
     assert_eq!(thread.updated_at, before_resume.updated_at);
+    assert_eq!(thread.recency_at, before_resume.recency_at);
     assert_eq!(thread.status, ThreadStatus::Idle);
 
     let after_modified = std::fs::metadata(&rollout.rollout_file_path)?.modified()?;
@@ -2088,7 +2879,7 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
-            thread_id,
+            thread_id: thread_id.clone(),
             input: vec![UserInput::Text {
                 text: "Hello".to_string(),
                 text_elements: Vec::new(),
@@ -2101,6 +2892,29 @@ async fn thread_resume_defers_updated_at_until_turn_start() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
     )
     .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.clone(),
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse {
+        thread: after_turn_start,
+        ..
+    } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert!(after_turn_start.recency_at > before_resume.recency_at);
+
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -2119,11 +2933,14 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = TestAppServer::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -2158,7 +2975,10 @@ async fn thread_resume_keeps_in_flight_turn_streaming() -> Result<()> {
     .await??;
     primary.clear_message_buffer();
 
-    let mut secondary = TestAppServer::new(codex_home.path()).await?;
+    let mut secondary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
 
     let turn_id = primary
@@ -2228,11 +3048,14 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = TestAppServer::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -2303,6 +3126,7 @@ async fn thread_resume_rejects_history_when_thread_is_running() -> Result<()> {
                     text: "history override".to_string(),
                 }],
                 phase: None,
+                internal_chat_message_metadata_passthrough: None,
             }]),
             ..Default::default()
         })
@@ -2346,11 +3170,14 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = TestAppServer::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -2449,6 +3276,7 @@ async fn thread_resume_rejects_mismatched_path_for_running_thread_id() -> Result
         "timestamp": "2025-01-01T00:00:00Z",
         "type": "session_meta",
         "payload": {
+            "session_id": thread_uuid,
             "id": thread_uuid,
             "timestamp": "2025-01-01T00:00:00Z",
             "cwd": codex_home.path(),
@@ -2514,11 +3342,14 @@ async fn thread_resume_rejoins_running_thread_even_with_override_mismatch() -> R
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = TestAppServer::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -2645,11 +3476,14 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = TestAppServer::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -2683,7 +3517,10 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
     )
     .await??;
 
-    let mut secondary = TestAppServer::new(codex_home.path()).await?;
+    let mut secondary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
 
     let resume_id = secondary
@@ -2711,6 +3548,12 @@ async fn thread_resume_can_skip_turns_when_thread_is_running() -> Result<()> {
 
 #[tokio::test]
 async fn thread_resume_replays_pending_command_execution_request_approval() -> Result<()> {
+    // TODO(anp): Remove after shell approval replay can route target-native cwd across host OSes.
+    skip_if_wine_exec!(
+        Ok(()),
+        "shell approval replay rejects the Windows cwd on the Linux host"
+    );
+
     let responses = vec![
         create_final_assistant_message_sse_response("seeded")?,
         create_shell_command_sse_response(
@@ -2729,11 +3572,14 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = TestAppServer::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -2849,6 +3695,12 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
 
 #[tokio::test]
 async fn thread_resume_replays_pending_file_change_request_approval() -> Result<()> {
+    // TODO(anp): Remove after apply-patch approval fixtures use a target-native workspace.
+    skip_if_remote!(
+        Ok(()),
+        "apply-patch approval fixture is only materialized on the host"
+    );
+
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
     std::fs::create_dir(&codex_home)?;
@@ -2868,11 +3720,14 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
     create_config_toml(&codex_home, &server.uri())?;
 
-    let mut primary = TestAppServer::new(&codex_home).await?;
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
@@ -3089,7 +3944,10 @@ async fn thread_resume_fails_when_required_mcp_server_fails_to_initialize() -> R
     let rollout = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
     create_config_toml_with_required_broken_mcp(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -3168,17 +4026,17 @@ async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> 
         /*git_info*/ None,
     )?;
     let refresh_token_url = format!("{}/oauth/token", server.uri());
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
             ("OPENAI_API_KEY", None),
             (
                 REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
                 Some(refresh_token_url.as_str()),
             ),
-        ],
-    )
-    .await?;
+        ])
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -3262,7 +4120,10 @@ async fn thread_resume_can_load_source_by_external_path() -> Result<()> {
     )?;
     let thread_path = rollout_path(external_home.path(), "2025-01-05T12-00-00", &thread_id);
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
@@ -3310,6 +4171,7 @@ async fn thread_resume_supports_history_and_overrides() -> Result<()> {
             text: history_text.to_string(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
 
     // Resume with explicit history and override the model.
@@ -3351,11 +4213,14 @@ async fn start_materialized_thread_and_restart(
     codex_home: &Path,
     seed_text: &str,
 ) -> Result<RestartedThreadFixture> {
-    let mut first_mcp = TestAppServer::new(codex_home).await?;
+    let mut first_mcp = TestAppServer::builder()
+        .with_codex_home(codex_home)
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, first_mcp.initialize()).await??;
 
     let start_id = first_mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
@@ -3410,7 +4275,10 @@ async fn start_materialized_thread_and_restart(
 
     drop(first_mcp);
 
-    let mut second_mcp = TestAppServer::new(codex_home).await?;
+    let mut second_mcp = TestAppServer::builder()
+        .with_codex_home(codex_home)
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, second_mcp.initialize()).await??;
 
     Ok(RestartedThreadFixture {
@@ -3441,12 +4309,15 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = TestAppServer::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
-        .send_thread_start_request(ThreadStartParams {
-            model: Some("gpt-5.3-codex".to_string()),
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("gpt-5.4".to_string()),
             ..Default::default()
         })
         .await?;
@@ -3479,13 +4350,16 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     )
     .await??;
 
-    let mut secondary = TestAppServer::new(codex_home.path()).await?;
+    let mut secondary = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
 
     let resume_id = secondary
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id,
-            model: Some("gpt-5.3-codex".to_string()),
+            model: Some("gpt-5.4".to_string()),
             personality: Some(Personality::Friendly),
             ..Default::default()
         })
@@ -3548,7 +4422,7 @@ fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io
         config_toml,
         format!(
             r#"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 approval_policy = "never"
 sandbox_mode = "read-only"
 
@@ -3578,7 +4452,7 @@ fn create_config_toml_with_chatgpt_base_url(
         config_toml,
         format!(
             r#"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 approval_policy = "never"
 sandbox_mode = "read-only"
 chatgpt_base_url = "{chatgpt_base_url}"
@@ -3608,7 +4482,7 @@ fn create_config_toml_with_required_broken_mcp(
         config_toml,
         format!(
             r#"
-model = "gpt-5.3-codex"
+model = "gpt-5.4"
 approval_policy = "never"
 sandbox_mode = "read-only"
 

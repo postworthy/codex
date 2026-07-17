@@ -19,7 +19,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 clap_complete = { workspace = true }
 codex-app-server = { workspace = true }
 codex-app-server-daemon = { workspace = true }
@@ -33,6 +33,7 @@ codex-utils-cli = { workspace = true }
 codex-config = { workspace = true }
 codex-core = { workspace = true }
 codex-core-plugins = { workspace = true }
+codex-home = { workspace = true }
 codex-exec = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-execpolicy = { workspace = true }
@@ -94,6 +95,7 @@ windows-sys = { version = "0.52", features = [
 ] }
 
 [dev-dependencies]
+app_test_support = { workspace = true }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
@@ -101,3 +103,9 @@ insta = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 sqlx = { workspace = true }
+wiremock = { workspace = true }
+
+[package.metadata.cargo-shear]
+# These Rust sources are intentionally Bazel-only macrobenchmarks rather than
+# Cargo targets.
+ignored-paths = ["e2e_benches/*.rs"]

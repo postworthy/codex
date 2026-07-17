@@ -30,9 +30,6 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use serde::Serialize;
 use std::path::PathBuf;
 
-const INVALID_REQUEST_SUBREASON_MAX_BYTES: usize = 512;
-const INVALID_REQUEST_SUBREASON_TRUNCATION_SUFFIX: &str = "...";
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AcceptedLineFingerprint {
     pub path_hash: String,
@@ -44,17 +41,20 @@ pub struct TrackEventsContext {
     pub model_slug: String,
     pub thread_id: String,
     pub turn_id: String,
+    pub product_client_id: String,
 }
 
 pub fn build_track_events_context(
     model_slug: String,
     thread_id: String,
     turn_id: String,
+    product_client_id: String,
 ) -> TrackEventsContext {
     TrackEventsContext {
         model_slug,
         thread_id,
         turn_id,
+        product_client_id,
     }
 }
 
@@ -104,6 +104,23 @@ pub struct TurnTokenUsageFact {
     pub token_usage: TokenUsage,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TurnProfile {
+    pub before_first_sampling_ms: u64,
+    pub sampling_ms: u64,
+    pub between_sampling_overhead_ms: u64,
+    pub tool_blocking_ms: u64,
+    pub after_last_sampling_ms: u64,
+    pub sampling_request_count: u32,
+    pub sampling_retry_count: u32,
+}
+
+#[derive(Clone)]
+pub struct TurnProfileFact {
+    pub turn_id: String,
+    pub profile: TurnProfile,
+}
+
 #[derive(Clone)]
 pub struct TurnCodexErrorFact {
     pub(crate) turn_id: String,
@@ -123,8 +140,9 @@ impl TurnCodexErrorFact {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CodexErrKind {
+pub enum CodexErrKind {
     TurnAborted,
+    SessionBudgetExceeded,
     Stream,
     ContextWindowExceeded,
     ThreadNotFound,
@@ -165,7 +183,6 @@ pub(crate) enum CodexErrKind {
 #[derive(Clone)]
 pub(crate) struct TurnCodexError {
     pub(crate) kind: CodexErrKind,
-    pub(crate) subreason: Option<String>,
     pub(crate) http_status_code: Option<u16>,
 }
 
@@ -173,26 +190,6 @@ impl TurnCodexError {
     fn from_codex_err(error: &CodexErr) -> Self {
         Self {
             kind: error.into(),
-            subreason: match error {
-                CodexErr::InvalidRequest(message) => {
-                    // InvalidRequest can contain raw provider response bodies, so bound the
-                    // analytics copy without changing the source CodexErr.
-                    let subreason = if message.len() <= INVALID_REQUEST_SUBREASON_MAX_BYTES {
-                        message.clone()
-                    } else {
-                        let truncated_len = message.floor_char_boundary(
-                            INVALID_REQUEST_SUBREASON_MAX_BYTES
-                                .saturating_sub(INVALID_REQUEST_SUBREASON_TRUNCATION_SUFFIX.len()),
-                        );
-                        format!(
-                            "{}{INVALID_REQUEST_SUBREASON_TRUNCATION_SUFFIX}",
-                            &message[..truncated_len]
-                        )
-                    };
-                    Some(subreason)
-                }
-                _ => None,
-            },
             http_status_code: error.http_status_code_value(),
         }
     }
@@ -202,6 +199,7 @@ impl From<&CodexErr> for CodexErrKind {
     fn from(error: &CodexErr) -> Self {
         match error {
             CodexErr::TurnAborted => CodexErrKind::TurnAborted,
+            CodexErr::SessionBudgetExceeded => CodexErrKind::SessionBudgetExceeded,
             CodexErr::Stream(..) => CodexErrKind::Stream,
             CodexErr::ContextWindowExceeded => CodexErrKind::ContextWindowExceeded,
             CodexErr::ThreadNotFound(_) => CodexErrKind::ThreadNotFound,
@@ -348,6 +346,7 @@ pub struct SubAgentThreadStartedInput {
     pub session_id: String,
     pub thread_id: String,
     pub parent_thread_id: Option<String>,
+    pub forked_from_thread_id: Option<String>,
     pub product_client_id: String,
     pub client_name: String,
     pub client_version: String,
@@ -370,6 +369,7 @@ pub enum CompactionReason {
     UserRequested,
     ContextLimit,
     ModelDownshift,
+    CompHashChanged,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -413,12 +413,38 @@ pub struct CodexCompactionEvent {
     pub phase: CompactionPhase,
     pub strategy: CompactionStrategy,
     pub status: CompactionStatus,
-    pub error: Option<String>,
+    pub codex_error_kind: Option<CodexErrKind>,
+    pub codex_error_http_status_code: Option<u16>,
     pub active_context_tokens_before: i64,
     pub active_context_tokens_after: i64,
+    pub retained_image_count: Option<usize>,
+    pub compaction_summary_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cache_write_input_tokens: Option<i64>,
     pub started_at: u64,
     pub completed_at: u64,
     pub duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalEventKind {
+    Created,
+    UsageAccounted,
+    StatusChanged,
+    Cleared,
+}
+
+#[derive(Clone)]
+pub struct CodexGoalEvent {
+    pub thread_id: String,
+    pub turn_id: Option<String>,
+    pub goal_id: String,
+    pub event_kind: GoalEventKind,
+    pub goal_status: codex_state::ThreadGoalStatus,
+    pub has_token_budget: bool,
+    pub cumulative_tokens_accounted: Option<i64>,
+    pub cumulative_time_accounted_seconds: Option<i64>,
 }
 
 #[allow(dead_code)]
@@ -439,6 +465,7 @@ pub(crate) enum AnalyticsFact {
         connection_id: u64,
         request_id: RequestId,
         response: Box<ClientResponsePayload>,
+        thread_originator: Option<String>,
     },
     ErrorResponse {
         connection_id: u64,
@@ -472,16 +499,22 @@ pub(crate) enum AnalyticsFact {
 pub(crate) enum CustomAnalyticsFact {
     SubAgentThreadStarted(SubAgentThreadStartedInput),
     Compaction(Box<CodexCompactionEvent>),
+    Goal(Box<CodexGoalEvent>),
     GuardianReview(Box<GuardianReviewEventParams>),
     TurnResolvedConfig(Box<TurnResolvedConfigFact>),
     TurnTokenUsage(Box<TurnTokenUsageFact>),
+    TurnProfile(Box<TurnProfileFact>),
     TurnCodexError(Box<TurnCodexErrorFact>),
     SkillInvoked(SkillInvokedInput),
     AppMentioned(AppMentionedInput),
     AppUsed(AppUsedInput),
     HookRun(HookRunInput),
     PluginUsed(PluginUsedInput),
+    PluginInstallRequested(PluginInstallRequestedInput),
     PluginStateChanged(PluginStateChangedInput),
+    PluginInstallFailed(PluginInstallFailedInput),
+    ExternalAgentConfigImportCompleted(ExternalAgentConfigImportCompletedInput),
+    ExternalAgentConfigImportFailure(ExternalAgentConfigImportFailureInput),
 }
 
 pub(crate) struct SkillInvokedInput {
@@ -515,9 +548,67 @@ pub(crate) struct PluginUsedInput {
     pub plugin: PluginTelemetryMetadata,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInstallRequestSource {
+    EndpointRecommendation,
+    LegacyDiscovery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginInstallRequested {
+    pub suggestion_id: String,
+    pub plugins: Vec<PluginInstallRequestedPlugin>,
+    pub source: PluginInstallRequestSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginInstallRequestedPlugin {
+    pub plugin_id: String,
+    pub remote_plugin_id: Option<String>,
+    pub plugin_name: String,
+    pub connector_ids: Vec<String>,
+}
+
+pub(crate) struct PluginInstallRequestedInput {
+    pub tracking: TrackEventsContext,
+    pub request: PluginInstallRequested,
+}
+
 pub(crate) struct PluginStateChangedInput {
     pub plugin: PluginTelemetryMetadata,
     pub state: PluginState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInstallSource {
+    Manual,
+    ExternalAgentMigration,
+}
+
+pub(crate) struct PluginInstallFailedInput {
+    pub plugin: PluginTelemetryMetadata,
+    pub source: PluginInstallSource,
+    pub error_type: String,
+    pub sub_error_type: Option<String>,
+}
+
+pub struct ExternalAgentConfigImportCompletedInput {
+    pub import_id: String,
+    pub source: String,
+    pub item_type: String,
+    pub success_count: usize,
+    pub failed_count: usize,
+}
+
+pub struct ExternalAgentConfigImportFailureInput {
+    pub import_id: String,
+    pub source: String,
+    pub item_type: String,
+    pub failure_stage: String,
+    pub error_type: String,
+    pub sub_error_type: Option<String>,
 }
 
 #[derive(Clone, Copy)]

@@ -4,14 +4,14 @@
 //! channels, submits thread-scoped operations through the app server, and replays buffered events
 //! when the visible thread changes.
 
+use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
+use crate::chatwidget::ThreadInputStateRestoreMode;
 use crate::session_resume::read_session_model;
 
 impl App {
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
         if let Some(thread_id) = self.chat_widget.thread_id() {
-            // Clear any in-flight rollback guard when switching threads.
-            self.backtrack.pending_rollback = None;
             if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
             }
@@ -210,22 +210,23 @@ impl App {
         &self,
         thread_id: ThreadId,
         request: &ServerRequest,
-    ) -> Option<ThreadInteractiveRequest> {
+    ) -> std::io::Result<Option<ThreadInteractiveRequest>> {
         let thread_label = Some(self.thread_label(thread_id));
-        match request {
+        Ok(match request {
             ServerRequest::CommandExecutionRequestApproval { params, .. } => {
                 let network_approval_context = params.network_approval_context.clone();
                 let additional_permissions = params.additional_permissions.clone();
                 let proposed_execpolicy_amendment = params.proposed_execpolicy_amendment.clone();
                 let proposed_network_policy_amendments =
                     params.proposed_network_policy_amendments.clone();
-                Some(ThreadInteractiveRequest::Approval(ApprovalRequest::Exec {
+                let approval = ExecApprovalRequest {
                     thread_id,
                     thread_label,
                     id: params
                         .approval_id
                         .clone()
                         .unwrap_or_else(|| params.item_id.clone()),
+                    environment_id: params.environment_id.clone(),
                     command: params
                         .command
                         .as_deref()
@@ -242,10 +243,14 @@ impl App {
                     }),
                     network_approval_context,
                     additional_permissions,
-                }))
+                };
+                Some(ThreadInteractiveRequest::Approval(ApprovalRequest::Exec(
+                    approval,
+                )))
             }
             ServerRequest::FileChangeRequestApproval { params, .. } => Some(
-                ThreadInteractiveRequest::Approval(ApprovalRequest::ApplyPatch {
+                ThreadInteractiveRequest::Approval(ApprovalRequest::ApplyPatch(
+                    ApplyPatchApprovalRequest {
                     thread_id,
                     thread_label,
                     id: params.item_id.clone(),
@@ -259,7 +264,8 @@ impl App {
                         .await
                         .map(crate::app_server_approval_conversions::file_update_changes_to_display)
                         .unwrap_or_default(),
-                }),
+                    },
+                )),
             ),
             ServerRequest::McpServerElicitationRequest { request_id, params } => {
                 if let Some(params) = AppLinkViewParams::from_url_app_server_request(
@@ -283,15 +289,18 @@ impl App {
                             message,
                             ..
                         } => Some(ThreadInteractiveRequest::Approval(
-                            ApprovalRequest::McpElicitation {
+                            ApprovalRequest::McpElicitation(McpElicitationApprovalRequest {
                                 thread_id,
                                 thread_label,
                                 server_name: params.server_name.clone(),
                                 request_id: request_id.clone(),
                                 message: message.clone(),
-                            },
+                            }),
                         )),
-                        codex_app_server_protocol::McpServerElicitationRequest::Url { .. } => {
+                        codex_app_server_protocol::McpServerElicitationRequest::OpenAiForm {
+                            ..
+                        }
+                        | codex_app_server_protocol::McpServerElicitationRequest::Url { .. } => {
                             self.app_event_tx.resolve_elicitation(
                                 thread_id,
                                 params.server_name.clone(),
@@ -305,18 +314,28 @@ impl App {
                     }
                 }
             }
-            ServerRequest::PermissionsRequestApproval { params, .. } => Some(
-                ThreadInteractiveRequest::Approval(ApprovalRequest::Permissions {
-                    thread_id,
-                    thread_label,
-                    call_id: params.item_id.clone(),
-                    environment_id: params.environment_id.clone(),
-                    reason: params.reason.clone(),
-                    permissions: params.permissions.clone().into(),
-                }),
-            ),
+            ServerRequest::PermissionsRequestApproval { params, .. } => {
+                // TODO(anp): Remove this native-path localization error path once core permission
+                // paths remain PathUri after crossing the app-server boundary.
+                let permissions = params.permissions.clone().try_into().map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("failed to localize requested filesystem paths: {err}"),
+                    )
+                })?;
+                Some(ThreadInteractiveRequest::Approval(
+                    ApprovalRequest::Permissions(PermissionsApprovalRequest {
+                        thread_id,
+                        thread_label,
+                        call_id: params.item_id.clone(),
+                        environment_id: params.environment_id.clone(),
+                        reason: params.reason.clone(),
+                        permissions,
+                    }),
+                ))
+            }
             _ => None,
-        }
+        })
     }
 
     pub(super) fn push_thread_interactive_request(&mut self, request: ThreadInteractiveRequest) {
@@ -336,20 +355,17 @@ impl App {
     }
 
     fn render_inactive_patch_preview(&mut self, request: &ApprovalRequest) {
-        let ApprovalRequest::ApplyPatch {
-            thread_label,
-            cwd,
-            changes,
-            ..
-        } = request
-        else {
+        let ApprovalRequest::ApplyPatch(request) = request else {
             return;
         };
-        if thread_label.is_none() || changes.is_empty() {
+        if request.thread_label.is_none() || request.changes.is_empty() {
             return;
         }
         self.chat_widget
-            .add_to_history(history_cell::new_patch_event(changes.clone(), cwd));
+            .add_to_history(history_cell::new_patch_event(
+                request.changes.clone(),
+                &request.cwd,
+            ));
     }
 
     pub(super) async fn pending_inactive_thread_requests(&self) -> Vec<(ThreadId, ServerRequest)> {
@@ -376,20 +392,23 @@ impl App {
         requests
     }
 
-    pub(super) async fn surface_pending_inactive_thread_interactive_requests(&mut self) {
+    pub(super) async fn surface_pending_inactive_thread_interactive_requests(
+        &mut self,
+    ) -> Result<()> {
         if self.active_side_parent_thread_id().is_some() {
-            return;
+            return Ok(());
         }
 
         let requests = self.pending_inactive_thread_requests().await;
         for (thread_id, request) in requests {
             if let Some(request) = self
                 .interactive_request_for_thread_request(thread_id, &request)
-                .await
+                .await?
             {
                 self.push_thread_interactive_request(request);
             }
         }
+        Ok(())
     }
 
     pub(super) async fn submit_active_thread_op(
@@ -498,11 +517,41 @@ impl App {
         op: &AppCommand,
     ) -> Result<bool> {
         match op {
-            AppCommand::Interrupt { .. } => {
+            AppCommand::Interrupt => {
                 if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
-                    app_server.turn_interrupt(thread_id, turn_id).await?;
+                    let mut interrupt_turn_id = turn_id;
+                    for retried_after_turn_mismatch in [false, true] {
+                        match app_server
+                            .turn_interrupt(thread_id, interrupt_turn_id.clone())
+                            .await
+                        {
+                            Ok(()) => return Ok(true),
+                            Err(error) if !retried_after_turn_mismatch => {
+                                let Some(actual_turn_id) = active_turn_interrupt_race(&error)
+                                else {
+                                    return Err(error).wrap_err("turn/interrupt failed in TUI");
+                                };
+                                if actual_turn_id == interrupt_turn_id {
+                                    return Err(error).wrap_err("turn/interrupt failed in TUI");
+                                }
+                                // Review flows can swap the active turn before the TUI processes
+                                // the corresponding notification. Retry once with the
+                                // server-reported turn id so Ctrl+C/Esc do not fatally exit on that
+                                // stale cache, but let lifecycle notifications own the cached
+                                // active turn id.
+                                interrupt_turn_id = actual_turn_id;
+                            }
+                            Err(error) => {
+                                return Err(error).wrap_err("turn/interrupt failed in TUI");
+                            }
+                        }
+                    }
+                    unreachable!("interrupt retry loop should return");
                 } else {
-                    app_server.startup_interrupt(thread_id).await?;
+                    app_server
+                        .startup_interrupt(thread_id)
+                        .await
+                        .wrap_err("turn/interrupt failed in TUI")?;
                 }
                 Ok(true)
             }
@@ -596,7 +645,7 @@ impl App {
                             .as_ref()
                             .map(|profile| &profile.permission_profile),
                     );
-                    app_server
+                    let response = app_server
                         .turn_start(
                             thread_id,
                             items.to_vec(),
@@ -606,7 +655,7 @@ impl App {
                             permissions_override,
                             config.permissions.user_visible_workspace_roots(),
                             model.to_string(),
-                            *effort,
+                            effort.clone(),
                             *summary,
                             service_tier.clone(),
                             collaboration_mode.clone(),
@@ -614,6 +663,12 @@ impl App {
                             final_output_json_schema.clone(),
                         )
                         .await?;
+                    if self.active_thread_id == Some(thread_id)
+                        && self.chat_widget.thread_id() == Some(thread_id)
+                    {
+                        self.chat_widget
+                            .record_safety_buffering_turn(response.turn.id, op);
+                    }
                 }
                 Ok(true)
             }
@@ -639,42 +694,19 @@ impl App {
                     .await?;
                 Ok(true)
             }
-            AppCommand::ThreadRollback { num_turns } => {
-                let response = match app_server.thread_rollback(thread_id, *num_turns).await {
-                    Ok(response) => response,
-                    Err(err) => {
-                        self.handle_backtrack_rollback_failed();
-                        return Err(err);
-                    }
-                };
-                self.handle_thread_rollback_response(thread_id, *num_turns, &response)
-                    .await;
-                Ok(true)
-            }
             AppCommand::Review { target } => {
-                app_server.review_start(thread_id, target.clone()).await?;
+                let response = app_server.review_start(thread_id, target.clone()).await?;
+                let review_thread_id = ThreadId::from_string(&response.review_thread_id)
+                    .wrap_err("review/start returned invalid review thread id")?;
+                let store = Arc::clone(&self.ensure_thread_channel(review_thread_id).store);
+                let mut store = store.lock().await;
+                store.active_turn_id = Some(response.turn.id);
                 Ok(true)
             }
             AppCommand::CleanBackgroundTerminals => {
                 app_server
                     .thread_background_terminals_clean(thread_id)
                     .await?;
-                Ok(true)
-            }
-            AppCommand::RealtimeConversationStart { transport, voice } => {
-                app_server
-                    .thread_realtime_start(thread_id, transport.clone(), voice.clone())
-                    .await?;
-                Ok(true)
-            }
-            AppCommand::RealtimeConversationAudio(frame) => {
-                app_server
-                    .thread_realtime_audio(thread_id, frame.clone())
-                    .await?;
-                Ok(true)
-            }
-            AppCommand::RealtimeConversationClose => {
-                app_server.thread_realtime_stop(thread_id).await?;
                 Ok(true)
             }
             AppCommand::RunUserShellCommand { command } => {
@@ -896,6 +928,14 @@ impl App {
         &mut self,
         notification: &ServerNotification,
     ) {
+        if let Some(activity) =
+            sub_agent_activity_item(notification).and_then(sub_agent_activity_display)
+        {
+            self.agent_navigation.record_sub_agent_activity(activity);
+            self.sync_active_agent_label();
+            return;
+        }
+
         let Some(receiver_thread_ids) = collab_receiver_thread_ids(notification) else {
             return;
         };
@@ -964,7 +1004,7 @@ impl App {
     ) -> Result<()> {
         let inactive_interactive_request = if self.active_thread_id != Some(thread_id) {
             self.interactive_request_for_thread_request(thread_id, &request)
-                .await
+                .await?
         } else {
             None
         };
@@ -1055,6 +1095,20 @@ impl App {
         session: ThreadSessionState,
         turns: Vec<Turn>,
     ) -> Result<()> {
+        self.enqueue_primary_thread_session_with_presentation(
+            session,
+            turns,
+            ThreadAttachPresentation::SessionLineage,
+        )
+        .await
+    }
+
+    pub(super) async fn enqueue_primary_thread_session_with_presentation(
+        &mut self,
+        session: ThreadSessionState,
+        turns: Vec<Turn>,
+        presentation: ThreadAttachPresentation,
+    ) -> Result<()> {
         let thread_id = session.thread_id;
         self.primary_thread_id = Some(thread_id);
         self.primary_session_configured = Some(session.clone());
@@ -1070,9 +1124,15 @@ impl App {
         self.activate_thread_channel(thread_id).await;
         self.chat_widget
             .set_initial_user_message_submit_suppressed(/*suppressed*/ true);
-        self.chat_widget.handle_thread_session(session);
-        let should_buffer_initial_replay =
-            self.terminal_resize_reflow_enabled() && !turns.is_empty();
+        match presentation {
+            ThreadAttachPresentation::SessionLineage => {
+                self.chat_widget.handle_thread_session(session);
+            }
+            ThreadAttachPresentation::PromptEdit => {
+                self.chat_widget.handle_prompt_edit_thread_session(session);
+            }
+        }
+        let should_buffer_initial_replay = !turns.is_empty();
         if should_buffer_initial_replay {
             self.app_event_tx
                 .send(AppEvent::BeginInitialHistoryReplayBuffer);
@@ -1082,6 +1142,9 @@ impl App {
         if should_buffer_initial_replay {
             self.app_event_tx
                 .send(AppEvent::EndInitialHistoryReplayBuffer);
+        }
+        if matches!(presentation, ThreadAttachPresentation::PromptEdit) {
+            self.chat_widget.emit_prompt_edit_thread_event();
         }
         let pending = std::mem::take(&mut self.pending_primary_events);
         for pending_event in pending {
@@ -1146,7 +1209,7 @@ impl App {
         }
 
         match app_server
-            .resume_thread(self.config.clone(), thread_id)
+            .resume_thread(self.config.clone(), thread_id, self.resume_model_settings())
             .await
         {
             Ok(started) => {
@@ -1261,8 +1324,8 @@ impl App {
         snapshot: ThreadEventSnapshot,
         resume_restored_queue: bool,
     ) {
-        let should_buffer_replay = self.terminal_resize_reflow_enabled()
-            && (!snapshot.turns.is_empty() || !snapshot.events.is_empty());
+        self.refresh_mcp_startup_expected_servers_from_config();
+        let should_buffer_replay = !snapshot.turns.is_empty() || !snapshot.events.is_empty();
         if should_buffer_replay {
             self.app_event_tx
                 .send(AppEvent::BeginThreadSwitchHistoryReplayBuffer);
@@ -1270,6 +1333,10 @@ impl App {
         let suppress_replay_notices =
             replay_filter::snapshot_has_pending_interactive_request(&snapshot);
         if let Some(session) = snapshot.session {
+            if session.reasoning_effort != Some(ReasoningEffortConfig::Ultra) {
+                self.chat_widget
+                    .set_plan_mode_reasoning_effort(self.config.plan_mode_reasoning_effort.clone());
+            }
             if self.side_threads.contains_key(&session.thread_id) {
                 self.chat_widget.handle_side_thread_session(session);
             } else if suppress_replay_notices {
@@ -1280,8 +1347,12 @@ impl App {
         }
         self.chat_widget
             .set_queue_autosend_suppressed(/*suppressed*/ true);
-        self.chat_widget
-            .restore_thread_input_state(snapshot.input_state);
+        self.chat_widget.restore_thread_input_state(
+            snapshot.input_state,
+            ThreadInputStateRestoreMode {
+                preserve_in_flight_turn: true,
+            },
+        );
         if !snapshot.turns.is_empty() {
             self.chat_widget
                 .replay_thread_turns(snapshot.turns, ReplayKind::ThreadSnapshot);
@@ -1342,42 +1413,9 @@ impl App {
     pub(super) fn handle_skills_list_response(&mut self, response: SkillsListResponse) {
         let cwd = self.chat_widget.config_ref().cwd.clone();
         let errors = errors_for_cwd(&cwd, &response);
+        let errors = self.skill_load_warnings.newly_active_errors(&errors);
         emit_skill_load_warnings(&self.app_event_tx, &errors);
         self.chat_widget.handle_skills_list_response(response);
-    }
-
-    pub(super) async fn handle_thread_rollback_response(
-        &mut self,
-        thread_id: ThreadId,
-        num_turns: u32,
-        response: &ThreadRollbackResponse,
-    ) {
-        if let Some(channel) = self.thread_event_channels.get(&thread_id) {
-            let mut store = channel.store.lock().await;
-            store.apply_thread_rollback(response);
-        }
-        if self.active_thread_id == Some(thread_id)
-            && let Some(mut rx) = self.active_thread_rx.take()
-        {
-            let mut disconnected = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(_) => {}
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-
-            if !disconnected {
-                self.active_thread_rx = Some(rx);
-            } else {
-                self.clear_active_thread().await;
-            }
-        }
-        self.handle_backtrack_rollback_succeeded(num_turns);
     }
 
     pub(super) fn handle_thread_event_now(&mut self, event: ThreadBufferedEvent) {

@@ -13,6 +13,7 @@ use super::MatcherGroup;
 fn hooks_file_deserializes_existing_json_shape() {
     let parsed: HooksFile = serde_json::from_str(
         r#"{
+  "description": "Optional stop-time review gate for Codex Companion.",
   "hooks": {
     "PreToolUse": [
       {
@@ -35,6 +36,7 @@ fn hooks_file_deserializes_existing_json_shape() {
     assert_eq!(
         parsed,
         HooksFile {
+            description: Some("Optional stop-time review gate for Codex Companion.".to_string()),
             hooks: HookEventsToml {
                 pre_tool_use: vec![MatcherGroup {
                     matcher: Some("^Bash$".to_string()),
@@ -49,6 +51,30 @@ fn hooks_file_deserializes_existing_json_shape() {
                 ..Default::default()
             },
         }
+    );
+}
+
+#[test]
+fn hooks_file_rejects_events_outside_hooks_object() {
+    let error = serde_json::from_str::<HooksFile>(
+        r#"{
+  "SessionStart": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 /tmp/session_start.py"
+        }
+      ]
+    }
+  ]
+}"#,
+    )
+    .expect_err("root-level hook events should be rejected");
+
+    assert!(
+        error.to_string().contains("unknown field `SessionStart`"),
+        "unexpected parse error: {error}"
     );
 }
 

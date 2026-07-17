@@ -9,7 +9,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+use codex_protocol::protocol::strip_user_message_prefix;
 use regex::Regex;
 use regex::RegexBuilder;
 use tokio::process::Command;
@@ -21,6 +21,7 @@ use super::compression;
 const MATCH_CONTEXT_BEFORE_CHARS: usize = 48;
 const MATCH_CONTEXT_AFTER_CHARS: usize = 96;
 
+/// Search matches keyed by the canonical `.jsonl` path for each rollout.
 pub type RolloutSearchMatches = HashMap<PathBuf, Option<String>>;
 
 pub async fn search_rollout_paths(
@@ -145,7 +146,10 @@ async fn scan_rollout_matches(
                 if let Some(snippet) =
                     first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
                 {
-                    matches.insert(rollout_file.into_path(), Some(snippet));
+                    matches.insert(
+                        compression::plain_rollout_path(rollout_file.path()),
+                        Some(snippet),
+                    );
                 }
                 continue;
             }
@@ -217,7 +221,10 @@ async fn scan_compressed_rollout_matches(
             if let Some(snippet) =
                 first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
             {
-                matches.insert(rollout_file.into_path(), Some(snippet));
+                matches.insert(
+                    compression::plain_rollout_path(rollout_file.path()),
+                    Some(snippet),
+                );
             }
         }
     }
@@ -276,7 +283,10 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::TurnContext(_)
         | RolloutItem::EventMsg(_)
         | RolloutItem::ResponseItem(_)
-        | RolloutItem::Compacted(_) => None,
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::Compacted(_)
+        | RolloutItem::WorldState(_) => None,
     }
 }
 
@@ -284,13 +294,6 @@ fn content_item_text(item: &ContentItem) -> Option<&str> {
     match item {
         ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text.as_str()),
         ContentItem::InputImage { .. } => None,
-    }
-}
-
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
     }
 }
 

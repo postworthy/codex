@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -17,11 +16,16 @@ use axum::http::Uri;
 use axum::http::header::AUTHORIZATION;
 use axum::routing::get;
 use codex_app_server_protocol::AppInfo;
+use codex_app_server_protocol::AppMetadata;
+use codex_app_server_protocol::AppTemplateSummary;
+use codex_app_server_protocol::AppTemplateUnavailableReason;
 use codex_app_server_protocol::HookEventName;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::PluginAuthPolicy;
+use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
+use codex_app_server_protocol::PluginInstallPolicySource;
 use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginShareDiscoverability;
@@ -32,20 +36,12 @@ use codex_app_server_protocol::PluginSkillReadParams;
 use codex_app_server_protocol::PluginSkillReadResponse;
 use codex_app_server_protocol::PluginSource;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ScheduledTaskSchedule;
+use codex_app_server_protocol::ScheduledTaskSummary;
+use codex_app_server_protocol::ScheduledTaskWeekday;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
-use rmcp::handler::server::ServerHandler;
-use rmcp::model::JsonObject;
-use rmcp::model::ListToolsResult;
-use rmcp::model::Meta;
-use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
-use rmcp::model::Tool;
-use rmcp::model::ToolAnnotations;
-use rmcp::transport::StreamableHttpServerConfig;
-use rmcp::transport::StreamableHttpService;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -64,7 +60,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 #[tokio::test]
 async fn plugin_read_rejects_missing_read_source() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -93,7 +93,11 @@ async fn plugin_read_rejects_missing_read_source() -> Result<()> {
 #[tokio::test]
 async fn plugin_read_rejects_multiple_read_sources() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -122,7 +126,7 @@ async fn plugin_read_rejects_multiple_read_sources() -> Result<()> {
 }
 
 #[tokio::test]
-async fn plugin_read_reads_remote_plugin_details_when_remote_plugin_is_disabled() -> Result<()> {
+async fn plugin_read_returns_remote_mcp_servers_when_uninstalled() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     std::fs::write(
@@ -133,6 +137,7 @@ chatgpt_base_url = "{}/backend-api/"
 
 [features]
 plugins = true
+apps = true
 "#,
             server.uri()
         ),
@@ -148,22 +153,67 @@ plugins = true
 
     let detail_body = r#"{
   "id": "plugins~Plugin_00000000000000000000000000000000",
-  "name": "linear",
+  "name": "example-plugin",
   "scope": "GLOBAL",
   "installation_policy": "AVAILABLE",
+  "installation_policy_source": "IMPLICIT_CANONICAL_APP",
   "authentication_policy": "ON_USE",
   "release": {
-    "display_name": "Linear",
-    "description": "Track work in Linear",
+    "version": "1.2.1",
+    "display_name": "Example Plugin",
+    "description": "Example plugin",
     "app_ids": [],
+    "app_manifest": {
+      "apps": {
+        "example-server": {
+          "id": "example-app"
+        }
+      }
+    },
     "keywords": [],
     "interface": {
-      "short_description": "Plan and track work",
+      "short_description": "Example plugin",
       "capabilities": [],
-      "default_prompt": "Use the legacy Linear prompt",
-      "default_prompts": []
+      "default_prompt": "Use the legacy example prompt",
+      "default_prompts": [],
+      "logo_url_dark": "https://example.com/example-plugin-dark.png"
     },
-    "skills": []
+    "skills": [],
+    "scheduled_tasks": [
+      {
+        "key": "weekday-triage",
+        "name": "Weekday triage",
+        "prompt": "Triage the support queue.",
+        "schedule": {
+          "type": "weekdays",
+          "time": "08:30"
+        }
+      },
+      {
+        "key": "queue-monitor",
+        "name": "Queue monitor",
+        "prompt": "Check the queue.",
+        "schedule": {
+          "type": "hourly",
+          "intervalHours": 2,
+          "days": ["MO", "WE", "FR"]
+        }
+      }
+    ],
+    "mcp_servers": [
+      {
+        "key": "example-server",
+        "metadata": {
+          "command": "example-mcp"
+        }
+      },
+      {
+        "key": "other-server",
+        "metadata": {
+          "command": "other-mcp"
+        }
+      }
+    ]
   }
 }"#;
     let installed_body = r#"{
@@ -191,8 +241,41 @@ plugins = true
         .respond_with(ResponseTemplate::new(200).set_body_string(installed_body))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/connectors/directory/list"))
+        .and(query_param("external_logos", "true"))
+        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("chatgpt-account-id", "account-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "apps": [
+                AppInfo {
+                    id: "example-app".to_string(),
+                    name: "Example App".to_string(),
+                    description: Some("Example app connector".to_string()),
+                    logo_url: Some("https://example.com/example.png".to_string()),
+                    logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: Some("featured".to_string()),
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    install_url: None,
+                    is_accessible: false,
+                    is_enabled: true,
+                    plugin_display_names: Vec::new(),
+                }
+            ],
+            "next_token": null
+        })))
+        .mount(&server)
+        .await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -211,14 +294,21 @@ plugins = true
     let response: PluginReadResponse = to_response(response)?;
 
     assert_eq!(response.plugin.marketplace_name, "openai-curated-remote");
-    assert_eq!(response.plugin.summary.id, "linear@openai-curated-remote");
+    assert_eq!(
+        response.plugin.summary.id,
+        "example-plugin@openai-curated-remote"
+    );
     assert_eq!(
         response.plugin.summary.remote_plugin_id.as_deref(),
         Some("plugins~Plugin_00000000000000000000000000000000")
     );
-    assert_eq!(response.plugin.summary.name, "linear");
+    assert_eq!(response.plugin.summary.name, "example-plugin");
     assert_eq!(response.plugin.summary.source, PluginSource::Remote);
     assert_eq!(response.plugin.summary.share_context, None);
+    assert_eq!(
+        response.plugin.summary.install_policy_source,
+        Some(PluginInstallPolicySource::ImplicitCanonicalApp)
+    );
     assert_eq!(
         response
             .plugin
@@ -226,7 +316,55 @@ plugins = true
             .interface
             .as_ref()
             .and_then(|interface| interface.default_prompt.clone()),
-        Some(vec!["Use the legacy Linear prompt".to_string()])
+        Some(vec!["Use the legacy example prompt".to_string()])
+    );
+    assert_eq!(
+        response
+            .plugin
+            .summary
+            .interface
+            .as_ref()
+            .and_then(|interface| interface.logo_url_dark.as_deref()),
+        Some("https://example.com/example-plugin-dark.png")
+    );
+    assert_eq!(
+        response.plugin.mcp_servers,
+        vec!["other-server".to_string()]
+    );
+    assert_eq!(
+        response.plugin.scheduled_tasks,
+        Some(vec![
+            ScheduledTaskSummary {
+                key: "weekday-triage".to_string(),
+                name: "Weekday triage".to_string(),
+                prompt: "Triage the support queue.".to_string(),
+                schedule: ScheduledTaskSchedule::Weekdays {
+                    time: "08:30".to_string(),
+                },
+            },
+            ScheduledTaskSummary {
+                key: "queue-monitor".to_string(),
+                name: "Queue monitor".to_string(),
+                prompt: "Check the queue.".to_string(),
+                schedule: ScheduledTaskSchedule::Hourly {
+                    interval_hours: 2,
+                    days: Some(vec![
+                        ScheduledTaskWeekday::Mo,
+                        ScheduledTaskWeekday::We,
+                        ScheduledTaskWeekday::Fr,
+                    ]),
+                },
+            },
+        ])
+    );
+    assert_eq!(
+        response
+            .plugin
+            .apps
+            .iter()
+            .map(|app| app.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["example-app"]
     );
     Ok(())
 }
@@ -308,7 +446,11 @@ async fn plugin_read_returns_share_context_for_shared_remote_plugin() -> Result<
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     for remote_marketplace_name in [
@@ -385,7 +527,7 @@ async fn plugin_read_returns_share_context_for_shared_remote_plugin() -> Result<
 }
 
 #[tokio::test]
-async fn plugin_read_reads_remote_plugin_details_when_remote_plugin_enabled() -> Result<()> {
+async fn plugin_read_includes_share_url_for_admin_disabled_remote_plugin() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_remote_plugin_catalog_config(
@@ -403,27 +545,52 @@ async fn plugin_read_reads_remote_plugin_details_when_remote_plugin_enabled() ->
 
     let detail_body = r#"{
   "id": "plugins~Plugin_00000000000000000000000000000000",
-  "name": "linear",
+  "name": "example-plugin",
   "scope": "GLOBAL",
+  "share_url": "https://chatgpt.example/plugins/share/example-plugin",
+  "status": "DISABLED_BY_ADMIN",
   "installation_policy": "AVAILABLE",
   "authentication_policy": "ON_USE",
   "release": {
-    "display_name": "Linear",
-    "description": "Track work in Linear",
+    "display_name": "Example Plugin",
+    "description": "Exercise example workflows",
     "app_ids": [],
-    "keywords": ["issue-tracking", "project management"],
+    "app_templates": [
+      {
+        "template_id": "templated_apps_SourceControlEnterprise",
+        "name": "Source Control Enterprise",
+        "description": "Connect source control",
+        "category": "Developer Tools",
+        "canonical_connector_id": "source_control_enterprise",
+        "logo_url": "https://example.com/source-control-light.png",
+        "logo_url_dark": "https://example.com/source-control-dark.png",
+        "materialized_app_ids": ["asdk_app_source_control"],
+        "reason": null
+      },
+      {
+        "template_id": "templated_apps_DataWarehouse",
+        "name": "Data Warehouse",
+        "description": null,
+        "canonical_connector_id": null,
+        "logo_url": null,
+        "logo_url_dark": null,
+        "materialized_app_ids": [],
+        "reason": "NOT_CONFIGURED_FOR_WORKSPACE"
+      }
+    ],
+    "keywords": ["workflow", "example"],
     "interface": {
-      "short_description": "Plan and track work",
+      "short_description": "Run example workflows",
       "capabilities": ["Read", "Write"],
-      "default_prompt": "Use the legacy Linear prompt",
-      "default_prompts": ["Create a Linear issue", "Review my Linear projects"],
-      "logo_url": "https://example.com/linear.png",
-      "screenshot_urls": ["https://example.com/linear-shot.png"]
+      "default_prompt": "Use the legacy example prompt",
+      "default_prompts": ["Create an example item", "Review example projects"],
+      "logo_url": "https://example.com/example-plugin.png",
+      "screenshot_urls": ["https://example.com/example-plugin-shot.png"]
     },
     "skills": [
       {
         "name": "plan-work",
-        "description": "Plan work from Linear issues",
+        "description": "Plan example work",
         "plugin_release_skill_id": "skill-1",
         "interface": {
           "display_name": "Plan Work",
@@ -437,24 +604,24 @@ async fn plugin_read_reads_remote_plugin_details_when_remote_plugin_enabled() ->
   "plugins": [
     {
       "id": "plugins~Plugin_00000000000000000000000000000000",
-      "name": "linear",
+      "name": "example-plugin",
       "scope": "GLOBAL",
       "installation_policy": "AVAILABLE",
       "authentication_policy": "ON_USE",
       "release": {
-        "display_name": "Linear",
-        "description": "Track work in Linear",
+        "display_name": "Example Plugin",
+        "description": "Exercise example workflows",
         "app_ids": [],
         "interface": {
-          "short_description": "Plan and track work",
+          "short_description": "Run example workflows",
           "capabilities": ["Read", "Write"],
-          "logo_url": "https://example.com/linear.png",
-          "screenshot_urls": ["https://example.com/linear-shot.png"]
+          "logo_url": "https://example.com/example-plugin.png",
+          "screenshot_urls": ["https://example.com/example-plugin-shot.png"]
         },
         "skills": [
           {
             "name": "plan-work",
-            "description": "Plan work from Linear issues",
+            "description": "Plan example work",
             "plugin_release_skill_id": "skill-1",
             "interface": {
               "display_name": "Plan Work",
@@ -491,7 +658,11 @@ async fn plugin_read_reads_remote_plugin_details_when_remote_plugin_enabled() ->
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -512,24 +683,33 @@ async fn plugin_read_reads_remote_plugin_details_when_remote_plugin_enabled() ->
     assert_eq!(response.plugin.marketplace_name, "openai-curated-remote");
     assert_eq!(response.plugin.marketplace_path, None);
     assert_eq!(response.plugin.summary.source, PluginSource::Remote);
-    assert_eq!(response.plugin.summary.id, "linear@openai-curated-remote");
+    assert_eq!(
+        response.plugin.summary.id,
+        "example-plugin@openai-curated-remote"
+    );
     assert_eq!(
         response.plugin.summary.remote_plugin_id.as_deref(),
         Some("plugins~Plugin_00000000000000000000000000000000")
     );
-    assert_eq!(response.plugin.summary.name, "linear");
+    assert_eq!(response.plugin.summary.name, "example-plugin");
     assert_eq!(response.plugin.summary.installed, true);
     assert_eq!(response.plugin.summary.enabled, false);
     assert_eq!(
+        response.plugin.summary.availability,
+        PluginAvailability::DisabledByAdmin
+    );
+    assert_eq!(response.plugin.summary.share_context, None);
+    assert_eq!(
+        response.plugin.share_url.as_deref(),
+        Some("https://chatgpt.example/plugins/share/example-plugin")
+    );
+    assert_eq!(
         response.plugin.description.as_deref(),
-        Some("Track work in Linear")
+        Some("Exercise example workflows")
     );
     assert_eq!(
         response.plugin.summary.keywords,
-        vec![
-            "issue-tracking".to_string(),
-            "project management".to_string()
-        ]
+        vec!["workflow".to_string(), "example".to_string()]
     );
     assert_eq!(
         response
@@ -539,8 +719,8 @@ async fn plugin_read_reads_remote_plugin_details_when_remote_plugin_enabled() ->
             .as_ref()
             .and_then(|interface| interface.default_prompt.clone()),
         Some(vec![
-            "Create a Linear issue".to_string(),
-            "Review my Linear projects".to_string(),
+            "Create an example item".to_string(),
+            "Review example projects".to_string(),
         ])
     );
     assert_eq!(response.plugin.skills.len(), 1);
@@ -548,6 +728,33 @@ async fn plugin_read_reads_remote_plugin_details_when_remote_plugin_enabled() ->
     assert_eq!(response.plugin.skills[0].path, None);
     assert_eq!(response.plugin.skills[0].enabled, false);
     assert_eq!(response.plugin.apps.len(), 0);
+    assert_eq!(
+        response.plugin.app_templates,
+        vec![
+            AppTemplateSummary {
+                template_id: "templated_apps_SourceControlEnterprise".to_string(),
+                name: "Source Control Enterprise".to_string(),
+                description: Some("Connect source control".to_string()),
+                category: Some("Developer Tools".to_string()),
+                canonical_connector_id: Some("source_control_enterprise".to_string()),
+                logo_url: Some("https://example.com/source-control-light.png".to_string()),
+                logo_url_dark: Some("https://example.com/source-control-dark.png".to_string()),
+                materialized_app_ids: vec!["asdk_app_source_control".to_string()],
+                reason: None,
+            },
+            AppTemplateSummary {
+                template_id: "templated_apps_DataWarehouse".to_string(),
+                name: "Data Warehouse".to_string(),
+                description: None,
+                category: None,
+                canonical_connector_id: None,
+                logo_url: None,
+                logo_url_dark: None,
+                materialized_app_ids: Vec::new(),
+                reason: Some(AppTemplateUnavailableReason::NotConfiguredForWorkspace),
+            },
+        ]
+    );
     Ok(())
 }
 
@@ -588,7 +795,11 @@ async fn plugin_skill_read_reads_remote_skill_contents_when_remote_plugin_enable
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -640,7 +851,11 @@ async fn plugin_read_maps_missing_remote_plugin_to_invalid_request() -> Result<(
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -692,7 +907,11 @@ remote_plugin = true
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -722,7 +941,11 @@ remote_plugin = true
 async fn plugin_read_rejects_invalid_remote_plugin_name() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_remote_plugin_catalog_config(codex_home.path(), "https://example.invalid/backend-api/")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -780,7 +1003,11 @@ enabled = true
     )?;
     write_installed_plugin(&codex_home, "openai-curated", "demo-plugin")?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let marketplace_path =
@@ -798,6 +1025,7 @@ enabled = true
         mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
     )
     .await??;
+    assert_eq!(response.result["plugin"]["scheduledTasks"], json!(null));
     let response: PluginReadResponse = to_response(response)?;
 
     assert_eq!(response.plugin.marketplace_name, "openai-curated");
@@ -836,6 +1064,10 @@ async fn plugin_read_returns_share_context_for_shared_local_plugin() -> Result<(
             .path()
             .join("demo-plugin/.codex-plugin/plugin.json"),
         r#"{"name":"demo-plugin","version":"1.2.3"}"#,
+    )?;
+    std::fs::write(
+        repo_root.path().join("demo-plugin/.mcp.json"),
+        r#"{"mcpServers":{"demo":{"command":"demo-mcp"}}}"#,
     )?;
     let plugin_path = AbsolutePathBuf::try_from(repo_root.path().join("demo-plugin"))?;
     write_plugin_share_local_path_mapping(codex_home.path(), "plugins_123", &plugin_path)?;
@@ -880,7 +1112,11 @@ async fn plugin_read_returns_share_context_for_shared_local_plugin() -> Result<(
         .expect(1)
         .mount(&server)
         .await;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -976,6 +1212,10 @@ async fn plugin_read_keeps_remote_version_when_share_principals_are_missing() ->
             .join("demo-plugin/.codex-plugin/plugin.json"),
         r#"{"name":"demo-plugin","version":"1.2.3"}"#,
     )?;
+    std::fs::write(
+        repo_root.path().join("demo-plugin/.mcp.json"),
+        r#"{"mcpServers":{"demo":{"command":"demo-mcp"}}}"#,
+    )?;
     let plugin_path = AbsolutePathBuf::try_from(repo_root.path().join("demo-plugin"))?;
     write_plugin_share_local_path_mapping(codex_home.path(), "plugins_123", &plugin_path)?;
     Mock::given(method("GET"))
@@ -1006,7 +1246,11 @@ async fn plugin_read_keeps_remote_version_when_share_principals_are_missing() ->
         .expect(1)
         .mount(&server)
         .await;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1062,7 +1306,11 @@ async fn plugin_read_falls_back_to_local_share_context_without_remote_auth() -> 
     let plugin_path = AbsolutePathBuf::try_from(repo_root.path().join("demo-plugin"))?;
     write_plugin_share_local_path_mapping(codex_home.path(), "plugins_123", &plugin_path)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1120,7 +1368,11 @@ async fn plugin_read_fails_on_malformed_share_mapping() -> Result<()> {
         "not valid json\n",
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1203,6 +1455,7 @@ async fn plugin_read_returns_plugin_details_with_bundle_contents() -> Result<()>
     "brandColor": "#3B82F6",
     "composerIcon": "./assets/icon.png",
     "logo": "./assets/logo.png",
+    "logoDark": "./assets/logo-dark.png",
     "screenshots": ["./assets/screenshot1.png"]
   }
 }"##,
@@ -1248,7 +1501,8 @@ description: Visible only for ChatGPT
         r#"{
   "apps": {
     "gmail": {
-      "id": "gmail"
+      "id": "gmail",
+      "category": "Communication"
     }
   }
 }"#,
@@ -1312,7 +1566,11 @@ enabled = false
     )?;
     write_installed_plugin(&codex_home, "codex-curated", "demo-plugin")?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let marketplace_path =
@@ -1381,6 +1639,18 @@ enabled = false
         ])
     );
     assert_eq!(
+        response
+            .plugin
+            .summary
+            .interface
+            .as_ref()
+            .and_then(|interface| interface.logo_dark.as_ref()),
+        Some(
+            &AbsolutePathBuf::try_from(plugin_root.join("assets/logo-dark.png"))
+                .expect("absolute dark logo path")
+        )
+    );
+    assert_eq!(
         response.plugin.summary.keywords,
         vec!["api-key".to_string(), "developer tools".to_string()]
     );
@@ -1418,14 +1688,17 @@ enabled = false
         response.plugin.apps[0].install_url.as_deref(),
         Some("https://chatgpt.com/apps/gmail/gmail")
     );
-    assert_eq!(response.plugin.apps[0].needs_auth, true);
+    assert_eq!(
+        response.plugin.apps[0].category.as_deref(),
+        Some("Communication")
+    );
     assert_eq!(response.plugin.mcp_servers.len(), 1);
     assert_eq!(response.plugin.mcp_servers[0], "demo");
     Ok(())
 }
 
 #[tokio::test]
-async fn plugin_read_returns_app_needs_auth() -> Result<()> {
+async fn plugin_read_returns_app_metadata_category() -> Result<()> {
     let connectors = vec![
         AppInfo {
             id: "alpha".to_string(),
@@ -1433,9 +1706,24 @@ async fn plugin_read_returns_app_needs_auth() -> Result<()> {
             description: Some("Alpha connector".to_string()),
             logo_url: Some("https://example.com/alpha.png".to_string()),
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: Some("featured".to_string()),
             branding: None,
-            app_metadata: None,
+            app_metadata: Some(AppMetadata {
+                review: None,
+                categories: Some(vec!["Productivity".to_string()]),
+                sub_categories: None,
+                seo_description: None,
+                screenshots: None,
+                developer: None,
+                version: None,
+                version_id: None,
+                version_notes: None,
+                first_party_type: None,
+                first_party_requires_install: None,
+                show_in_composer_when_unlinked: None,
+            }),
             labels: None,
             install_url: None,
             is_accessible: false,
@@ -1448,6 +1736,8 @@ async fn plugin_read_returns_app_needs_auth() -> Result<()> {
             description: Some("Beta connector".to_string()),
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,
@@ -1458,8 +1748,7 @@ async fn plugin_read_returns_app_needs_auth() -> Result<()> {
             plugin_display_names: Vec::new(),
         },
     ];
-    let tools = vec![connector_tool("beta", "Beta App")?];
-    let (server_url, server_handle) = start_apps_server(connectors, tools).await?;
+    let (server_url, server_handle) = start_apps_server(connectors).await?;
 
     let codex_home = TempDir::new()?;
     write_connectors_config(codex_home.path(), &server_url)?;
@@ -1483,7 +1772,11 @@ async fn plugin_read_returns_app_needs_auth() -> Result<()> {
     let marketplace_path =
         AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1506,10 +1799,101 @@ async fn plugin_read_returns_app_needs_auth() -> Result<()> {
             .plugin
             .apps
             .iter()
-            .map(|app| (app.id.as_str(), app.needs_auth))
+            .map(|app| (app.id.as_str(), app.category.as_deref()))
             .collect::<Vec<_>>(),
-        vec![("alpha", true), ("beta", false)]
+        vec![("alpha", Some("Productivity")), ("beta", None)]
     );
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_read_hides_apps_for_api_key_auth() -> Result<()> {
+    let connectors = vec![AppInfo {
+        id: "alpha".to_string(),
+        name: "Alpha".to_string(),
+        description: Some("Alpha connector".to_string()),
+        logo_url: Some("https://example.com/alpha.png".to_string()),
+        logo_url_dark: None,
+        icon_assets: None,
+        icon_dark_assets: None,
+        distribution_channel: Some("featured".to_string()),
+        branding: None,
+        app_metadata: Some(AppMetadata {
+            review: None,
+            categories: Some(vec!["Productivity".to_string()]),
+            sub_categories: None,
+            seo_description: None,
+            screenshots: None,
+            developer: None,
+            version: None,
+            version_id: None,
+            version_notes: None,
+            first_party_type: None,
+            first_party_requires_install: None,
+            show_in_composer_when_unlinked: None,
+        }),
+        labels: None,
+        install_url: None,
+        is_accessible: false,
+        is_enabled: true,
+        plugin_display_names: Vec::new(),
+    }];
+    let (server_url, server_handle) = start_apps_server(connectors).await?;
+
+    let codex_home = TempDir::new()?;
+    write_connectors_config(codex_home.path(), &server_url)?;
+    std::fs::write(
+        codex_home.path().join("auth.json"),
+        r#"{"OPENAI_API_KEY":"sk-test-key","tokens":null,"last_refresh":null}"#,
+    )?;
+
+    let repo_root = TempDir::new()?;
+    write_plugin_marketplace(
+        repo_root.path(),
+        "debug",
+        "sample-plugin",
+        "./sample-plugin",
+    )?;
+    write_plugin_source(repo_root.path(), "sample-plugin", &["alpha"])?;
+    std::fs::write(
+        repo_root.path().join("sample-plugin/.mcp.json"),
+        r#"{"mcpServers":{"alpha":{"command":"alpha-mcp"}}}"#,
+    )?;
+    let marketplace_path =
+        AbsolutePathBuf::try_from(repo_root.path().join(".agents/plugins/marketplace.json"))?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            ("CODEX_ACCESS_TOKEN", None),
+            ("CODEX_API_KEY", None),
+            ("OPENAI_API_KEY", None),
+        ])
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_plugin_read_request(PluginReadParams {
+            marketplace_path: Some(marketplace_path),
+            remote_marketplace_name: None,
+            plugin_name: "sample-plugin".to_string(),
+        })
+        .await?;
+
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let response: PluginReadResponse = to_response(response)?;
+
+    assert!(response.plugin.apps.is_empty());
+    assert_eq!(response.plugin.mcp_servers, vec!["alpha".to_string()]);
 
     server_handle.abort();
     let _ = server_handle.await;
@@ -1550,7 +1934,11 @@ async fn plugin_read_accepts_legacy_string_default_prompt() -> Result<()> {
     )?;
     write_plugins_enabled_config(&codex_home)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1612,7 +2000,11 @@ async fn plugin_read_describes_uninstalled_git_source_without_cloning() -> Resul
     )?;
     write_plugins_enabled_config(&codex_home)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1675,7 +2067,11 @@ async fn plugin_read_returns_invalid_request_when_plugin_is_missing() -> Result<
     )?;
     write_plugins_enabled_config(&codex_home)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1728,7 +2124,11 @@ async fn plugin_read_returns_invalid_request_when_plugin_manifest_is_missing() -
     )?;
     write_plugins_enabled_config(&codex_home)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1786,70 +2186,22 @@ struct AppsServerState {
     response: Arc<StdMutex<serde_json::Value>>,
 }
 
-#[derive(Clone)]
-struct PluginReadMcpServer {
-    tools: Arc<StdMutex<Vec<Tool>>>,
-}
-
-impl ServerHandler for PluginReadMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-    }
-
-    fn list_tools(
-        &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_
-    {
-        let tools = self.tools.clone();
-        async move {
-            let tools = tools
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            Ok(ListToolsResult {
-                tools,
-                next_cursor: None,
-                meta: None,
-            })
-        }
-    }
-}
-
-async fn start_apps_server(
-    connectors: Vec<AppInfo>,
-    tools: Vec<Tool>,
-) -> Result<(String, JoinHandle<()>)> {
+async fn start_apps_server(connectors: Vec<AppInfo>) -> Result<(String, JoinHandle<()>)> {
     let state = Arc::new(AppsServerState {
         response: Arc::new(StdMutex::new(
             json!({ "apps": connectors, "next_token": null }),
         )),
     });
-    let tools = Arc::new(StdMutex::new(tools));
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let mcp_service = StreamableHttpService::new(
-        {
-            let tools = tools.clone();
-            move || {
-                Ok(PluginReadMcpServer {
-                    tools: tools.clone(),
-                })
-            }
-        },
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
-    );
     let router = Router::new()
         .route("/connectors/directory/list", get(list_directory_connectors))
         .route(
             "/connectors/directory/list_workspace",
             get(list_directory_connectors),
         )
-        .with_state(state)
-        .nest_service("/api/codex/apps", mcp_service);
+        .with_state(state);
 
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
@@ -1889,33 +2241,13 @@ async fn list_directory_connectors(
     }
 }
 
-fn connector_tool(connector_id: &str, connector_name: &str) -> Result<Tool> {
-    let schema: JsonObject = serde_json::from_value(json!({
-        "type": "object",
-        "additionalProperties": false
-    }))?;
-    let mut tool = Tool::new(
-        Cow::Owned(format!("connector_{connector_id}")),
-        Cow::Borrowed("Connector test tool"),
-        Arc::new(schema),
-    );
-    tool.annotations = Some(ToolAnnotations::new().read_only(true));
-
-    let mut meta = Meta::new();
-    meta.0
-        .insert("connector_id".to_string(), json!(connector_id));
-    meta.0
-        .insert("connector_name".to_string(), json!(connector_name));
-    tool.meta = Some(meta);
-    Ok(tool)
-}
-
 fn write_connectors_config(codex_home: &std::path::Path, base_url: &str) -> std::io::Result<()> {
     std::fs::write(
         codex_home.join("config.toml"),
         format!(
             r#"
 chatgpt_base_url = "{base_url}"
+cli_auth_credentials_store = "file"
 mcp_oauth_credentials_store = "file"
 
 [features]
@@ -1938,7 +2270,6 @@ chatgpt_base_url = "{base_url}"
 
 [features]
 plugins = true
-remote_plugin = true
 "#
         ),
     )

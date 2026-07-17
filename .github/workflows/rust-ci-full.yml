@@ -1,17 +1,12 @@
 name: rust-ci-full
 on:
+  workflow_call:
   push:
     branches:
-      - main
+      # Main pushes enter through postmerge-ci. Keep this opt-in branch trigger
+      # for developers who want the full suite before merging.
       - "**full-ci**"
   workflow_dispatch:
-
-# CI builds in debug (dev) for faster signal.
-env:
-  # Cargo's libgit2 transport has been flaky on macOS when fetching git
-  # dependencies with nested submodules. Use the system git CLI, which has
-  # better network/proxy behavior and matches Cargo's own suggested fallback.
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   # --- CI that doesn't need specific targets ---------------------------------
@@ -26,12 +21,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: rustfmt
-      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
-        with:
-          tool: just
       - name: cargo fmt
         run: cargo fmt -- --config imports_granularity=Item --check
       - name: Rust benchmark smoke test
@@ -48,6 +41,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
@@ -66,6 +60,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           toolchain: nightly-2025-09-18
@@ -102,6 +97,9 @@ jobs:
     name: Argument comment lint - ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: 30
+    environment:
+      name: bazel
+      deployment: false
     strategy:
       fail-fast: false
       matrix:
@@ -113,8 +111,8 @@ jobs:
           - name: Windows
             runner: windows-x64
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -122,7 +120,6 @@ jobs:
       - uses: ./.github/actions/setup-bazel-ci
         with:
           target: ${{ runner.os }}
-          install-test-prereqs: true
       - name: Install Linux sandbox build dependencies
         if: ${{ runner.os == 'Linux' }}
         shell: bash
@@ -172,8 +169,6 @@ jobs:
       USE_SCCACHE: ${{ (startsWith(matrix.runner, 'windows') || (matrix.runner == 'macos-15-xlarge' && matrix.target == 'x86_64-apple-darwin')) && 'false' || 'true' }}
       CARGO_INCREMENTAL: "0"
       SCCACHE_CACHE_SIZE: 10G
-      # In rust-ci, representative release-profile checks use thin LTO for faster feedback.
-      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.profile == 'release' && 'thin' || 'fat' }}
 
     strategy:
       fail-fast: false
@@ -189,38 +184,38 @@ jobs:
             target: x86_64-unknown-linux-musl
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-linux-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-x64
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-linux-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-x64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-linux-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-arm64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-linux-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-arm64
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             profile: dev
             runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-arm64
 
           # Also run representative release builds on Mac and Linux because
           # there could be release-only build errors we want to catch.
@@ -233,31 +228,32 @@ jobs:
             target: x86_64-unknown-linux-musl
             profile: release
             runs_on:
-              group: codex-runners
-              labels: codex-linux-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-x64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             profile: release
             runs_on:
-              group: codex-runners
-              labels: codex-linux-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-linux-arm64
           - runner: windows-x64
             target: x86_64-pc-windows-msvc
             profile: release
             runs_on:
-              group: codex-runners
-              labels: codex-windows-x64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-x64
           - runner: windows-arm64
             target: aarch64-pc-windows-msvc
             profile: release
             runs_on:
-              group: codex-runners
-              labels: codex-windows-arm64
+              group: ${{ github.event.repository.name }}-runners
+              labels: ${{ github.event.repository.name }}-windows-arm64
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - uses: ./.github/actions/setup-ci
       - name: Install Linux build dependencies
         if: ${{ runner.os == 'Linux' }}
         shell: bash
@@ -412,7 +408,7 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: cargo-timings-rust-ci-clippy-${{ matrix.target }}-${{ matrix.profile }}
-          path: codex-rs/target/**/cargo-timings/cargo-timing.html
+          path: ${{ env.CARGO_TARGET_DIR }}/**/cargo-timings/cargo-timing.html
           if-no-files-found: warn
 
       # Save caches explicitly; make non-fatal so cache packaging
@@ -485,8 +481,8 @@ jobs:
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: ubuntu-24.04
-      runner_group: codex-runners
-      runner_labels: codex-linux-x64
+      runner_group: ${{ github.event.repository.name }}-runners
+      runner_labels: ${{ github.event.repository.name }}-linux-x64
       target: x86_64-unknown-linux-gnu
       profile: ci-test
       artifact_id: linux-x64-remote
@@ -500,8 +496,8 @@ jobs:
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: ubuntu-24.04-arm
-      runner_group: codex-runners
-      runner_labels: codex-linux-arm64
+      runner_group: ${{ github.event.repository.name }}-runners
+      runner_labels: ${{ github.event.repository.name }}-linux-arm64
       target: aarch64-unknown-linux-gnu
       profile: ci-test
       artifact_id: linux-arm64
@@ -514,8 +510,8 @@ jobs:
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: windows-x64
-      runner_group: codex-runners
-      runner_labels: codex-windows-x64
+      runner_group: ${{ github.event.repository.name }}-runners
+      runner_labels: ${{ github.event.repository.name }}-windows-x64
       target: x86_64-pc-windows-msvc
       profile: ci-test
       artifact_id: windows-x64
@@ -528,11 +524,11 @@ jobs:
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: windows-arm64
-      runner_group: codex-runners
-      runner_labels: codex-windows-arm64
+      runner_group: ${{ github.event.repository.name }}-runners
+      runner_labels: ${{ github.event.repository.name }}-windows-arm64
       archive_runner: windows-x64
-      archive_runner_group: codex-runners
-      archive_runner_labels: codex-windows-x64
+      archive_runner_group: ${{ github.event.repository.name }}-runners
+      archive_runner_labels: ${{ github.event.repository.name }}-windows-x64
       target: aarch64-pc-windows-msvc
       profile: ci-test
       artifact_id: windows-arm64

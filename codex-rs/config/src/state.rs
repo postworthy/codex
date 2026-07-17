@@ -6,10 +6,10 @@ use super::fingerprint::version_for_toml;
 use super::key_aliases::normalized_with_key_aliases;
 use super::merge::merge_toml_values;
 use crate::CloudConfigBundleLoader;
+use crate::ConfigLayer;
+use crate::ConfigLayerMetadata;
+use crate::ConfigLayerSource;
 use crate::ProfileV2Name;
-use codex_app_server_protocol::ConfigLayer;
-use codex_app_server_protocol::ConfigLayerMetadata;
-use codex_app_server_protocol::ConfigLayerSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -73,14 +73,18 @@ impl LoaderOverrides {
         }
     }
 
-    /// Returns overrides with host MDM disabled and managed config loaded from `managed_config_path`.
+    /// Returns overrides with host MDM disabled and managed config loaded from
+    /// `managed_config_path`. System requirements are loaded from a sibling
+    /// `requirements.toml` fixture.
     ///
     /// This is intended for tests that supply an explicit managed config fixture.
     pub fn with_managed_config_path_for_tests(managed_config_path: PathBuf) -> Self {
+        let system_requirements_path = managed_config_path.with_file_name("requirements.toml");
         Self {
             user_config_path: None,
             user_config_profile: None,
             managed_config_path: Some(managed_config_path),
+            system_requirements_path: Some(system_requirements_path),
             ..Self::without_managed_config_for_tests()
         }
     }

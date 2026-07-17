@@ -4,6 +4,7 @@
 // definitions that do not contain business logic.
 
 pub use crate::mcp_types::AppToolApproval;
+pub use crate::mcp_types::McpServerAuth;
 pub use crate::mcp_types::McpServerConfig;
 pub use crate::mcp_types::McpServerDisabledReason;
 pub use crate::mcp_types::McpServerEnvVar;
@@ -102,7 +103,9 @@ pub enum AuthCredentialsStoreMode {
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OAuthCredentialsStoreMode {
-    /// `Keyring` when available; otherwise, `File`.
+    /// Prefer `Keyring` and use `File` when keyring storage is unavailable.
+    /// Once an MCP client loads credentials from one store, that client keeps the resolved store
+    /// for its lifetime so refreshes cannot switch to a possibly stale credential source.
     /// Credentials stored in the keyring will only be readable by Codex unless the user explicitly grants access via OS-level keyring access.
     #[default]
     Auto,
@@ -111,6 +114,26 @@ pub enum OAuthCredentialsStoreMode {
     File,
     /// Keyring when available, otherwise fail.
     Keyring,
+}
+
+/// Determine how auth credentials should use keyring-backed storage.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthKeyringBackendKind {
+    /// Store the serialized auth payload directly in the OS keyring.
+    Direct,
+    /// Store auth payloads in the local encrypted secrets file, with the file key in the OS keyring.
+    Secrets,
+}
+
+impl Default for AuthKeyringBackendKind {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::Secrets
+        } else {
+            Self::Direct
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
@@ -380,6 +403,10 @@ pub struct AppsDefaultConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
+    /// Reviewer for approval prompts unless overridden by per-app settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+
     /// Whether tools with `destructive_hint = true` are allowed by default.
     #[serde(
         default = "default_enabled",
@@ -393,6 +420,10 @@ pub struct AppsDefaultConfig {
         skip_serializing_if = "std::clone::Clone::clone"
     )]
     pub open_world_enabled: bool,
+
+    /// Approval mode for tools unless overridden by per-app or per-tool settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tools_approval_mode: Option<AppToolApproval>,
 }
 
 /// Per-tool settings for a single app tool.
@@ -890,17 +921,6 @@ pub struct SandboxWorkspaceWrite {
     pub exclude_tmpdir_env_var: bool,
     #[serde(default)]
     pub exclude_slash_tmp: bool,
-}
-
-impl From<SandboxWorkspaceWrite> for codex_app_server_protocol::SandboxSettings {
-    fn from(sandbox_workspace_write: SandboxWorkspaceWrite) -> Self {
-        Self {
-            writable_roots: sandbox_workspace_write.writable_roots,
-            network_access: Some(sandbox_workspace_write.network_access),
-            exclude_tmpdir_env_var: Some(sandbox_workspace_write.exclude_tmpdir_env_var),
-            exclude_slash_tmp: Some(sandbox_workspace_write.exclude_slash_tmp),
-        }
-    }
 }
 
 /// Policy for building the `env` when spawning a process via shell-like tools.

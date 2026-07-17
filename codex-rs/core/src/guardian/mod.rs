@@ -156,10 +156,6 @@ use prompt::collect_guardian_transcript_entries;
 #[cfg(test)]
 use prompt::guardian_output_schema;
 #[cfg(test)]
-pub(crate) use prompt::guardian_policy_prompt;
-#[cfg(test)]
-pub(crate) use prompt::guardian_policy_prompt_with_config;
-#[cfg(test)]
 use prompt::guardian_truncate_text;
 #[cfg(test)]
 use prompt::parse_guardian_assessment;
@@ -168,7 +164,7 @@ use prompt::render_guardian_transcript_entries;
 #[cfg(test)]
 use review::GuardianReviewOutcome;
 #[cfg(test)]
-use review::run_guardian_review_session as run_guardian_review_session_for_test;
+use review::run_guardian_review_session_with_retry as run_guardian_review_session_for_test;
 #[cfg(test)]
 use review_session::build_guardian_review_session_config as build_guardian_review_session_config_for_test;
 

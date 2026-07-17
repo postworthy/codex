@@ -19,6 +19,7 @@ In the codex-rs folder where the rust code lives:
 - Avoid bool or ambiguous `Option` parameters that force callers to write hard-to-read code such as `foo(false)` or `bar(None)`. Prefer enums, named methods, newtypes, or other idiomatic Rust API shapes when they keep the callsite self-documenting.
 - When you cannot make that API change and still need a small positional-literal callsite in Rust, follow the `argument_comment_lint` convention:
   - Use an exact `/*param_name*/` comment before opaque literal arguments such as `None`, booleans, and numeric literals when passing them by position.
+  - A method's sole non-self argument is exempt when the method and parameter names match, such as `.enabled(false)` for `fn enabled(&self, enabled: bool)`.
   - Do not add these comments for string or char literals unless the comment adds real clarity; those literals are intentionally exempt from the lint.
   - The parameter name in the comment must exactly match the callee signature.
   - You can run `just argument-comment-lint` to run the lint check locally. This is powered by Bazel, so running it the first time can be slow if Bazel is not warmed up, though incremental invocations should take <15s. Most of the time, it is best to update the PR and let CI take responsibility for checking this (or run it asynchronously in the background after submitting the PR). Note CI checks all three platforms, which the local run does not.
@@ -31,20 +32,25 @@ In the codex-rs folder where the rust code lives:
   - Implementations may still use `async fn foo(&self, ...) -> T` when they satisfy that contract.
   - Do not use `#[allow(async_fn_in_trait)]` as a shortcut around spelling the future contract explicitly.
 - When writing tests, prefer comparing the equality of entire objects over fields one by one.
+- Do not add tests for values that are statically defined.
+- Do not add negative tests for logic that was removed.
 - Do not add general product or user-facing documentation to the `docs/` folder. The official Codex documentation lives elsewhere. The exception is app-server API documentation, which is covered by the app-server guidance below.
 - Prefer private modules and explicitly exported public crate API.
 - If you change `ConfigToml` or nested config types, run `just write-config-schema` to update `codex-rs/core/config.schema.json`.
 - When working with MCP tool calls, prefer using `codex-rs/codex-mcp/src/mcp_connection_manager.rs` to handle mutation of tools and tool calls. Aim to minimize the footprint of changes and leverage existing abstractions rather than plumbing code through multiple levels of function calls.
 - Do not call `reset_client_session` unnecessarily; let the incremental check logic decide whether to reuse the previous request.
 - If you change Rust dependencies (`Cargo.toml` or `Cargo.lock`), run `just bazel-lock-update` from the
-  repo root to refresh `MODULE.bazel.lock`, and include that lockfile update in the same change.
-- After dependency changes, run `just bazel-lock-check` from the repo root so lockfile drift is caught
-  locally before CI.
+  repo root to refresh `MODULE.bazel.lock`, and include that lockfile update in the same change. CI
+  verifies lockfile drift.
 - Bazel does not automatically make source-tree files available to compile-time Rust file access. If
   you add `include_str!`, `include_bytes!`, `sqlx::migrate!`, or similar build-time file or
   directory reads, update the crate's `BUILD.bazel` (`compile_data`, `build_script_data`, or test
   data) or Bazel may fail even when Cargo passes.
 - Do not create small helper methods that are referenced only once.
+- For tracing async work, instrument the function or method definition with
+  `#[tracing::instrument(...)]` instead of attaching spans to futures with
+  `.instrument(...)` at call sites. Before adding instrumentation, check whether the callee—or
+  the implementation method it immediately delegates to—is already instrumented.
 - Avoid large modules:
   - Prefer adding new modules instead of growing existing ones.
   - Target Rust modules under 500 LoC, excluding tests.
@@ -83,6 +89,10 @@ Likewise, when reviewing code, do not hesitate to push back on PRs that would un
 
 ## Code Review Rules
 
+### Crate API surface
+
+Keep crate API surfaces as small as possible. Avoid proliferating test-only helpers.
+
 ### Model visible context
 
 Codex maintains a context (history of messages) that is sent to the model in inference requests.
@@ -99,6 +109,7 @@ Codex maintains a context (history of messages) that is sent to the model in inf
 Search for breaking changes in external integration surfaces:
 
 - app-server APIs
+- raw response item events (`rawResponseItem/*`), even while experimental
 - CLI parameters
 - configuration loading
 - resuming sessions from existing rollouts
@@ -195,6 +206,12 @@ If you don’t have the tool:
 
 - `cargo install --locked cargo-insta`
 
+### Benchmarks
+
+cargo benchmarks can be run with `just bench`, use the divan crate to write new ones.
+
+Use `just bench-smoke` to dry-run the benchmark for a single iteration to ensure it works.
+
 ### Test assertions
 
 - Tests should use pretty_assertions::assert_eq for clearer diffs. Import this at the top of the test module if it isn't already.
@@ -207,10 +224,13 @@ If you don’t have the tool:
   - Under Bazel, binaries and resources may live under runfiles; use `codex_utils_cargo_bin::cargo_bin` to resolve absolute paths that remain stable after `chdir`.
 - When locating fixture files or test resources under Bazel, avoid `env!("CARGO_MANIFEST_DIR")`. Prefer `codex_utils_cargo_bin::find_resource!` so paths resolve correctly under both Cargo and Bazel runfiles.
 
-### Integration tests (core)
+### Integration tests
+
+#### codex_core integration testing
 
 - Prefer the utilities in `core_test_support::responses` when writing end-to-end Codex tests.
-
+- Use `TestCodexBuilder::build_with_auto_env()` by default to ensure that new tests work with
+  foreign app/exec OSes. See $remote-tests for details.
 - All `mount_sse*` helpers return a `ResponseMock`; hold onto it so you can assert against outbound `/responses` POST bodies.
 - Use `ResponseMock::single_request()` when a test should only issue one POST, or `ResponseMock::requests()` to inspect every captured `ResponsesRequest`.
 - `ResponsesRequest` exposes helpers (`body_json`, `input`, `function_call_output`, `custom_tool_call_output`, `call_output`, `header`, `path`, `query_param`) so assertions can target structured payloads instead of manual JSON digging.
@@ -234,6 +254,14 @@ If you don’t have the tool:
   // assert using request.function_call_output(call_id) or request.json_body() or other helpers.
   ```
 
+#### app-server integration testing
+
+- Tests should exercise app-server's public JSON-RPC API.
+- Use similar server mocking as for core integration tests.
+- Use `TestAppServer::builder().build()` and `TestAppServer::send_thread_start_request_with_auto_env()`
+  by default to ensure that new tests work with foreign app/exec OSes. See `$remote-tests` for
+  details.
+
 ## App-server API Development Best Practices
 
 These guidelines apply to app-server protocol work in `codex-rs`, especially:
@@ -249,6 +277,7 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
   `*Params` for request payloads, `*Response` for responses, and `*Notification` for notifications.
 - Expose RPC methods as `<resource>/<method>` and keep `<resource>` singular (for example, `thread/read`, `app/list`).
 - Always expose fields as camelCase on the wire with `#[serde(rename_all = "camelCase")]` unless a tagged union or explicit compatibility requirement needs a targeted rename.
+- Always expose string enum values as camelCase on the wire with matching serde and TS `rename_all = "camelCase"` annotations unless an explicit compatibility requirement needs targeted renames.
 - Exception: config RPC payloads are expected to use snake_case to mirror config.toml keys (see the config read/write/list APIs in `app-server-protocol/src/protocol/v2.rs`).
 - Always set `#[ts(export_to = "v2/")]` on v2 request/response/notification types so generated TypeScript lands in the correct namespace.
 - Never use `#[serde(skip_serializing_if = "Option::is_none")]` for v2 API payload fields.
@@ -289,3 +318,10 @@ This project uses Python 3+. You should not use the `__future__` module.
 
 If you need to worry about feature compatibility between different 3.xx point releases, check the
 closest `pyproject.toml`'s `requires-python` field to see what minimum runtime version is supported.
+
+## Platform Support
+
+Tests and features must support Linux, macOS and Windows unless feature is explicitly OS-specific.
+
+Codex supports running connected app-server and exec-server on different operating systems. See the
+`$remote-tests` skill for details about integration testing these configurations.

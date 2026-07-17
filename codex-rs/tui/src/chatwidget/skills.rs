@@ -10,10 +10,10 @@ use crate::bottom_pane::SkillsToggleView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::skills_helpers::skill_description;
 use crate::skills_helpers::skill_display_name;
-use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::SkillMetadata as ProtocolSkillMetadata;
 use codex_app_server_protocol::SkillsListEntry;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_connectors::AppInfo;
 use codex_core_skills::model::SkillDependencies;
 use codex_core_skills::model::SkillInterface;
 use codex_core_skills::model::SkillMetadata;
@@ -33,10 +33,17 @@ impl ChatWidget {
     }
 
     pub(crate) fn open_skills_menu(&mut self) {
+        let list_shortcut = if self.config.features.enabled(Feature::MentionsV2) {
+            '@'
+        } else {
+            '$'
+        };
         let items = vec![
             SelectionItem {
                 name: "List skills".to_string(),
-                description: Some("Tip: press $ to open this list directly.".to_string()),
+                description: Some(format!(
+                    "Tip: press {list_shortcut} to open this list directly."
+                )),
                 actions: vec![Box::new(|tx| {
                     tx.send(AppEvent::OpenSkillsList);
                 })],
@@ -514,6 +521,8 @@ mod tests {
             description: None,
             logo_url: None,
             logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
             distribution_channel: None,
             branding: None,
             app_metadata: None,

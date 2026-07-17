@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ToolPayload;
+use crate::tools::handlers::McpHandler;
+use crate::tools::registry::CoreToolRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistry;
@@ -10,6 +13,9 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ResponsesApiTool;
 use codex_extension_api::ToolCall as ExtensionToolCall;
 use codex_extension_api::ToolExecutor;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -44,7 +50,6 @@ impl codex_extension_api::ToolContributor for ExtensionEchoContributor {
 
 struct ExtensionEchoExecutor;
 
-#[async_trait::async_trait]
 impl ToolExecutor<ExtensionToolCall> for ExtensionEchoExecutor {
     fn tool_name(&self) -> ToolName {
         ToolName::namespaced("extension/", "echo")
@@ -73,7 +78,13 @@ impl ToolExecutor<ExtensionToolCall> for ExtensionEchoExecutor {
         })
     }
 
-    async fn handle(
+    fn handle(&self, call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(self.handle_call(call))
+    }
+}
+
+impl ExtensionEchoExecutor {
+    async fn handle_call(
         &self,
         call: ExtensionToolCall,
     ) -> Result<Box<dyn codex_tools::ToolOutput>, codex_tools::FunctionCallError> {
@@ -84,7 +95,7 @@ impl ToolExecutor<ExtensionToolCall> for ExtensionEchoExecutor {
             "callId": call.call_id,
             "conversationHistory": call.conversation_history.items(),
             "ok": true,
-        }))))
+        }))) as Box<dyn codex_tools::ToolOutput>)
     }
 }
 
@@ -95,28 +106,19 @@ fn extension_tool_test_registry() -> Arc<ExtensionRegistry<Config>> {
 }
 
 #[tokio::test]
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "test builds a router from session-owned MCP manager state"
-)]
 async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow::Result<()> {
-    let (session, turn) = make_session_and_context().await;
-    let mcp_tools = session
-        .services
-        .mcp_connection_manager
-        .read()
-        .await
-        .list_all_tools()
-        .await;
-    let router = ToolRouter::from_turn_context(
-        &turn,
+    let (_, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
         ToolRouterParams {
-            deferred_mcp_tools: None,
-            mcp_tools: Some(mcp_tools),
-            discoverable_tools: None,
+            tool_suggest_candidates: None,
+            tool_runtimes: Vec::new(),
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn.dynamic_tools.as_slice(),
         },
+        &Default::default(),
     );
 
     let parallel_tool_name = ["exec_command", "shell_command"]
@@ -153,6 +155,7 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
         namespace: Some("mcp__codex_apps__calendar".to_string()),
         arguments: "{}".to_string(),
         call_id: "call-namespace".to_string(),
+        internal_chat_message_metadata_passthrough: None,
     })?
     .expect("function_call should produce a tool call");
 
@@ -172,30 +175,61 @@ async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()> {
+    let tool_name = "exec".to_string();
+
+    let call = ToolRouter::build_tool_call(ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: "call-namespace".to_string(),
+        name: tool_name.clone(),
+        namespace: Some("mcp__python".to_string()),
+        input: "print('hello')".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    })?
+    .expect("custom_tool_call should produce a tool call");
+
+    assert_eq!(
+        call,
+        ToolCall {
+            tool_name: ToolName::namespaced("mcp__python", tool_name),
+            call_id: "call-namespace".to_string(),
+            payload: ToolPayload::Custom {
+                input: "print('hello')".to_string(),
+            },
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
-    let router = ToolRouter::from_turn_context(
-        &turn,
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
         ToolRouterParams {
-            deferred_mcp_tools: None,
-            mcp_tools: Some(vec![
-                mcp_tool_info(
+            tool_suggest_candidates: None,
+            tool_runtimes: vec![
+                mcp_runtime(mcp_tool_info(
                     "echo",
                     /*supports_parallel_tool_calls*/ true,
                     "mcp__echo__",
                     "query_with_delay",
-                ),
-                mcp_tool_info(
+                )),
+                mcp_runtime(mcp_tool_info(
                     "hello_echo",
                     /*supports_parallel_tool_calls*/ false,
                     "mcp__hello_echo__",
                     "query_with_delay",
-                ),
-            ]),
-            discoverable_tools: None,
+                )),
+            ],
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn.dynamic_tools.as_slice(),
         },
+        &Default::default(),
     );
 
     let call = ToolCall {
@@ -222,15 +256,17 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
 #[tokio::test]
 async fn tools_without_handlers_do_not_support_parallel() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
-    let router = ToolRouter::from_turn_context(
-        &turn,
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
         ToolRouterParams {
-            deferred_mcp_tools: None,
-            mcp_tools: None,
-            discoverable_tools: None,
+            tool_suggest_candidates: None,
+            tool_runtimes: Vec::new(),
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn.dynamic_tools.as_slice(),
         },
+        &Default::default(),
     );
 
     assert!(!router.tool_supports_parallel(&ToolCall {
@@ -247,42 +283,46 @@ async fn tools_without_handlers_do_not_support_parallel() -> anyhow::Result<()> 
 #[tokio::test]
 async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
     let hidden_tool = "hidden_dynamic_tool";
     let visible_tool = "visible_dynamic_tool";
-    let dynamic_tools = vec![
-        DynamicToolSpec {
-            namespace: Some("codex_app".to_string()),
-            name: hidden_tool.to_string(),
-            description: "Hidden until discovered.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
+    let dynamic_tools = vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        name: "codex_app".to_string(),
+        description: "Codex app tools.".to_string(),
+        tools: vec![
+            DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+                name: hidden_tool.to_string(),
+                description: "Hidden until discovered.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                defer_loading: true,
             }),
-            defer_loading: true,
-        },
-        DynamicToolSpec {
-            namespace: Some("codex_app".to_string()),
-            name: visible_tool.to_string(),
-            description: "Visible immediately.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
+            DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
+                name: visible_tool.to_string(),
+                description: "Visible immediately.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                defer_loading: false,
             }),
-            defer_loading: false,
-        },
-    ];
+        ],
+    })];
 
-    let router = ToolRouter::from_turn_context(
-        &turn,
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
         ToolRouterParams {
-            deferred_mcp_tools: None,
-            mcp_tools: None,
-            discoverable_tools: None,
+            tool_suggest_candidates: None,
+            tool_runtimes: Vec::new(),
             extension_tool_executors: Vec::new(),
             dynamic_tools: &dynamic_tools,
         },
+        &Default::default(),
     );
 
     assert_eq!(
@@ -313,16 +353,23 @@ fn mcp_tool_info(
                 "type": "object",
             }))),
         ),
+        openai_file_input_optional_fields: Default::default(),
         connector_id: None,
         connector_name: None,
         plugin_display_names: Vec::new(),
     }
 }
 
+fn mcp_runtime(tool_info: codex_mcp::ToolInfo) -> Arc<dyn CoreToolRuntime> {
+    Arc::new(McpHandler::new(tool_info).expect("MCP tool spec should build"))
+}
+
 #[tokio::test]
 async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow::Result<()> {
     let (mut session, turn) = make_session_and_context().await;
     session.services.extensions = extension_tool_test_registry();
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
     let history_item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -330,20 +377,23 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
             text: "extension history".to_string(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     session
         .record_conversation_items(&turn, std::slice::from_ref(&history_item))
         .await;
+    let mut expected_history_item = history_item.clone();
+    expected_history_item.set_turn_id_if_missing(&turn.sub_id);
 
-    let router = ToolRouter::from_turn_context(
-        &turn,
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
         ToolRouterParams {
-            deferred_mcp_tools: None,
-            mcp_tools: None,
-            discoverable_tools: None,
+            tool_suggest_candidates: None,
+            tool_runtimes: Vec::new(),
             extension_tool_executors: extension_tool_executors(&session),
             dynamic_tools: turn.dynamic_tools.as_slice(),
         },
+        &Default::default(),
     );
 
     assert!(
@@ -364,12 +414,13 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         namespace: Some("extension/".to_string()),
         arguments: json!({ "message": "hello" }).to_string(),
         call_id: "call-extension".to_string(),
+        internal_chat_message_metadata_passthrough: None,
     })?
     .expect("function_call should produce a tool call");
     let result = router
         .dispatch_tool_call_with_code_mode_result(
             Arc::new(session),
-            Arc::new(turn),
+            step_context,
             CancellationToken::new(),
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call,
@@ -391,7 +442,7 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
                 json!({
                     "arguments": { "message": "hello" },
                     "callId": "call-extension",
-                    "conversationHistory": [history_item],
+                    "conversationHistory": [expected_history_item],
                     "ok": true,
                 })
             );
@@ -418,7 +469,6 @@ fn namespace_function_names(specs: &[ToolSpec], namespace_name: &str) -> Vec<Str
             ToolSpec::Function(_)
             | ToolSpec::Freeform(_)
             | ToolSpec::ToolSearch { .. }
-            | ToolSpec::ImageGeneration { .. }
             | ToolSpec::WebSearch { .. }
             | ToolSpec::Namespace(_) => None,
         })

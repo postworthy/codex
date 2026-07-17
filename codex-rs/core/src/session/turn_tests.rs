@@ -1,37 +1,40 @@
 use super::*;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
+use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
 struct RewriteAgentMessageContributor;
 
-#[async_trait::async_trait]
 impl TurnItemContributor for RewriteAgentMessageContributor {
-    async fn contribute(
-        &self,
-        _thread_store: &ExtensionData,
-        _turn_store: &ExtensionData,
-        item: &mut TurnItem,
-    ) -> Result<(), String> {
-        if let TurnItem::AgentMessage(agent_message) = item {
-            agent_message.content = vec![AgentMessageContent::Text {
-                text: "plan contributed assistant text".to_string(),
-            }];
-        }
-        Ok(())
+    fn contribute<'a>(
+        &'a self,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+        item: &'a mut TurnItem,
+    ) -> codex_extension_api::ExtensionFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if let TurnItem::AgentMessage(agent_message) = item {
+                agent_message.content = vec![AgentMessageContent::Text {
+                    text: "plan contributed assistant text".to_string(),
+                }];
+            }
+            Ok(())
+        })
     }
 }
 
 fn assistant_output_text(text: &str) -> ResponseItem {
     ResponseItem::Message {
-        id: Some("msg-1".to_string()),
+        id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
         phase: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
