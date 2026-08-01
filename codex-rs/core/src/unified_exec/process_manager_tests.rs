@@ -110,9 +110,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         .expect("current dir")
         .try_into()
         .expect("absolute path");
-    let file_system_sandbox_policy =
-        codex_protocol::permissions::FileSystemSandboxPolicy::unrestricted();
-    let network_sandbox_policy = codex_protocol::permissions::NetworkSandboxPolicy::Restricted;
     let permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     let managed_network = ManagedNetworkSandboxContext {
         loopback_ports: vec![43123],
@@ -167,8 +164,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
         windows_sandbox_private_desktop: false,
         permission_profile: permission_profile.clone(),
-        file_system_sandbox_policy,
-        network_sandbox_policy,
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
         exec_server_sandbox: None,
@@ -177,8 +172,16 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         exec_server_network_proxy: None,
     };
 
-    let params =
-        exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
+    let proxy_settings_mode = codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve;
+    let params_for_request = |request: &ExecRequest| {
+        exec_server_params_for_request(
+            /*process_id*/ 123,
+            request,
+            proxy_settings_mode,
+            /*tty*/ true,
+        )
+    };
+    let params = params_for_request(&request);
 
     assert_eq!(params.process_id.as_str(), "123");
     assert_eq!(params.cwd, request.cwd);
@@ -200,10 +203,15 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     request.exec_server_sandbox = Some(
         codex_exec_server::FileSystemSandboxContext::from_permission_profile(permission_profile),
     );
-    let first =
-        exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
-    let second =
-        exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
+    let first = params_for_request(&request);
+    let second = params_for_request(&request);
+    assert_eq!(
+        first
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.windows_sandbox_proxy_settings_mode),
+        Some(codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve)
+    );
     assert!(first.process_id.as_str().starts_with("123-"));
     assert!(second.process_id.as_str().starts_with("123-"));
     assert_ne!(first.process_id, second.process_id);
@@ -216,6 +224,14 @@ fn initial_exec_yield_time_uses_windows_floor() {
 
     assert_eq!(
         clamp_yield_time(/*yield_time_ms*/ 1_000),
+        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+    );
+    assert_eq!(
+        clamp_yield_time(/*yield_time_ms*/ 2_000),
+        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+    );
+    assert_eq!(
+        clamp_yield_time(/*yield_time_ms*/ 5_000),
         crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
     );
     assert_eq!(clamp_yield_time(/*yield_time_ms*/ 10_000), 10_000);
@@ -394,6 +410,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         &request,
         #[allow(deprecated)]
         turn.cwd.clone().into(),
+        /*plugin_attribution*/ None,
         transcript,
         "PRE_DENIAL_MARKER".to_string(),
         "Network access denied".to_string(),
@@ -495,6 +512,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
             /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
         )
         .await,
     );
@@ -506,6 +524,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
             /*terminate_error*/ None,
+            codex_sandboxing::SandboxType::None,
         )
         .await,
     );

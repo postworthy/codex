@@ -79,6 +79,7 @@ mod mcp_auth_elicitation;
 mod mcp_auth_refresh;
 #[cfg(unix)]
 mod mcp_refresh_cleanup;
+mod mcp_startup_refresh_http_proxy;
 mod mcp_tool_cache;
 mod mcp_tool_exposure;
 mod mcp_turn_metadata;
@@ -150,6 +151,7 @@ mod unified_exec_process_events;
 #[cfg(unix)]
 mod unified_exec_zsh_fork_approvals;
 mod unstable_features_warning;
+mod user_message_admission;
 mod user_notification;
 mod user_shell_cmd;
 mod view_image;

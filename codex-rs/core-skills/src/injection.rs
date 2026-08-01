@@ -99,6 +99,7 @@ pub async fn build_skill_injections(
                     skill_scope: skill.scope,
                     skill_path: skill.path_to_skills_md.to_path_buf(),
                     plugin_id: skill.plugin_id.clone(),
+                    remote_plugin_id: skill.remote_plugin_id.clone(),
                     invocation_type: InvocationType::Explicit,
                 });
                 result.items.push(SkillInjection {
@@ -141,7 +142,11 @@ fn emit_skill_injected_metric(
     otel.counter(
         "codex.skill.injected",
         /*inc*/ 1,
-        &[("status", status), ("skill", skill_name_tag.as_str())],
+        &[
+            ("status", status),
+            ("skill", skill_name_tag.as_str()),
+            ("invoke_type", "explicit"),
+        ],
     );
 }
 

@@ -13,13 +13,10 @@ use codex_utils_plugins::PluginSkillRoot;
 
 pub use codex_core_skills::SkillError;
 pub use codex_core_skills::SkillLoadOutcome;
-pub use codex_core_skills::SkillRenderReport;
 pub use codex_core_skills::SkillsLoadInput;
 pub use codex_core_skills::SkillsService;
-pub use codex_core_skills::build_available_skills;
 pub use codex_core_skills::build_skill_name_counts;
 pub use codex_core_skills::config_rules;
-pub use codex_core_skills::default_skill_metadata_budget;
 pub use codex_core_skills::detect_implicit_skill_invocation_for_command;
 pub use codex_core_skills::filter_skill_load_outcome_for_product;
 pub use codex_core_skills::injection;
@@ -29,8 +26,6 @@ pub use codex_core_skills::injection::collect_explicit_skill_mentions;
 pub use codex_core_skills::loader;
 pub use codex_core_skills::model;
 pub use codex_core_skills::remote;
-pub use codex_core_skills::render;
-pub use codex_core_skills::render::SkillRenderSideEffects;
 pub use codex_core_skills::service;
 pub use codex_core_skills::system;
 pub use codex_skills::SkillMetadata;
@@ -66,6 +61,7 @@ pub(crate) async fn maybe_emit_implicit_skill_invocation(
         skill_scope: candidate.scope,
         skill_path: candidate.path_to_skills_md.to_path_buf(),
         plugin_id: candidate.plugin_id,
+        remote_plugin_id: candidate.remote_plugin_id,
         invocation_type: InvocationType::Implicit,
     };
     let skill_scope = match invocation.skill_scope {

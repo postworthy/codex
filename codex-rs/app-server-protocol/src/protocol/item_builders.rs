@@ -37,7 +37,6 @@ use codex_protocol::review_format::REVIEW_FALLBACK_MESSAGE;
 use codex_protocol::review_format::render_review_output_text;
 use codex_shell_command::parse_command::parse_command;
 use codex_shell_command::parse_command::shlex_join;
-use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -79,6 +78,8 @@ pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> Th
     let command_actions = command_actions_for_path_uri(&payload.parsed_cmd, &payload.cwd);
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
+        plugin_id: payload.plugin_id.clone(),
+        script_path: payload.script_path.clone(),
         command: shlex_join(&payload.command),
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
@@ -102,6 +103,8 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
 
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
+        plugin_id: payload.plugin_id.clone(),
+        script_path: payload.script_path.clone(),
         command: shlex_join(&payload.command),
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
@@ -118,33 +121,32 @@ pub(crate) fn command_actions_for_path_uri(
     parsed_cmd: &[ParsedCommand],
     cwd: &PathUri,
 ) -> Vec<CommandAction> {
-    // TODO(anp): Carry PathUri into CommandAction so foreign Read actions retain resolved paths.
-    // Until then, omit those actions rather than project a foreign cwd onto the host.
-    let native_cwd = if cwd.infer_path_convention() == Some(PathConvention::native()) {
-        cwd.to_abs_path().ok()
-    } else {
-        None
-    };
-
     parsed_cmd
         .iter()
         .cloned()
         .filter_map(|parsed| match parsed {
-            ParsedCommand::Read { cmd, name, path } => match native_cwd.as_ref() {
-                Some(native_cwd) => Some(CommandAction::Read {
-                    command: cmd,
-                    name,
-                    path: native_cwd.join(path),
-                }),
-                None => {
-                    warn!(
-                        command = cmd,
-                        %cwd,
-                        "omitting read command action whose path cannot be resolved against a foreign cwd"
-                    );
-                    None
+            ParsedCommand::Read { cmd, name, path } => {
+                // Resolve against the executor's URI, not the app-server's filesystem. POSIX
+                // non-UTF-8 paths are percent-encoded, not opaque. Expanding `~` or resolving a
+                // genuinely opaque cwd would require executor-native state unavailable here.
+                match cwd.join(path.to_string_lossy().as_ref()) {
+                    Ok(path) => Some(CommandAction::Read {
+                        command: cmd,
+                        name,
+                        path: path.into(),
+                    }),
+                    Err(error) => {
+                        warn!(
+                            command = cmd,
+                            %cwd,
+                            file_path = %path.display(),
+                            %error,
+                            "omitting read action: invalid file path or cwd"
+                        );
+                        None
+                    }
                 }
-            },
+            }
             ParsedCommand::ListFiles { cmd, path } => {
                 Some(CommandAction::ListFiles { command: cmd, path })
             }
@@ -175,6 +177,8 @@ pub fn build_item_from_guardian_event(
             }];
             Some(ThreadItem::CommandExecution {
                 id: id.clone(),
+                plugin_id: assessment.plugin_id.clone(),
+                script_path: assessment.script_path.clone(),
                 command,
                 cwd: cwd.clone().into(),
                 process_id: None,
@@ -211,6 +215,8 @@ pub fn build_item_from_guardian_event(
             };
             Some(ThreadItem::CommandExecution {
                 id: id.clone(),
+                plugin_id: assessment.plugin_id.clone(),
+                script_path: assessment.script_path.clone(),
                 command,
                 cwd: cwd.clone().into(),
                 process_id: None,

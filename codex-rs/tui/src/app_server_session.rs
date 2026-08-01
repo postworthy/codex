@@ -1270,7 +1270,7 @@ impl AppServerSession {
         self.client.request_handle()
     }
 
-    fn next_request_id(&mut self) -> RequestId {
+    pub(crate) fn next_request_id(&mut self) -> RequestId {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         RequestId::Integer(request_id)
@@ -2678,6 +2678,8 @@ mod tests {
                 parent_thread_id: None,
                 preview: "hello".to_string(),
                 ephemeral: false,
+                section: None,
+                section_entered_at: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
                 created_at: 1,
@@ -2937,6 +2939,18 @@ mod tests {
         );
         assert!(matches!(
             team,
+            Some(StatusAccountDisplay::ChatGpt {
+                email: None,
+                plan: Some(ref plan),
+            }) if plan == "Business"
+        ));
+
+        let business_prolite = status_account_display_from_auth_mode(
+            Some(AuthMode::Chatgpt),
+            Some(codex_protocol::account::PlanType::SelfServeBusinessProLite),
+        );
+        assert!(matches!(
+            business_prolite,
             Some(StatusAccountDisplay::ChatGpt {
                 email: None,
                 plan: Some(ref plan),

@@ -29,9 +29,11 @@ use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
@@ -63,7 +65,6 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
 /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
 /// initial context into the replacement history just above the last real user message.
-#[derive(Debug)]
 pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage {
         world_state: Arc<WorldState>,
@@ -93,10 +94,9 @@ pub(crate) async fn build_compaction_initial_context(
             step_context,
         } => {
             let items = sess
-                .build_initial_context_with_world_state_and_mcp(
+                .build_initial_context_with_world_state(
                     step_context.turn.as_ref(),
                     world_state.as_ref(),
-                    step_context.mcp.as_ref(),
                 )
                 .await;
             (items, Some(Arc::clone(world_state)))
@@ -293,16 +293,21 @@ async fn run_compact_task_inner_impl(
             Ok(()) => {
                 break;
             }
-            Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
+            Err(err)
+                if matches!(
+                    err.details(),
+                    CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+                ) =>
+            {
                 return Err(err);
             }
-            Err(e @ CodexErr::SessionBudgetExceeded) => {
+            Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                 sess.send_event(&turn_context, event).await;
                 return Err(e);
             }
-            Err(e @ CodexErr::ContextWindowExceeded) => {
+            Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
                 if turn_input_len > 1 {
                     // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
                     error!(
@@ -481,7 +486,14 @@ impl CompactionAnalyticsAttempt {
 pub(crate) fn compaction_status_from_result<T>(result: &CodexResult<T>) -> CompactionStatus {
     match result {
         Ok(_) => CompactionStatus::Completed,
-        Err(CodexErr::Interrupted | CodexErr::TurnAborted) => CompactionStatus::Interrupted,
+        Err(err)
+            if matches!(
+                err.details(),
+                CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+            ) =>
+        {
+            CompactionStatus::Interrupted
+        }
         Err(_) => CompactionStatus::Failed,
     }
 }
@@ -544,7 +556,7 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
 /// model-expected boundary.
 ///
 /// Placement rules:
-/// - Prefer immediately before the last real user message.
+/// - Prefer immediately before the last real user or agent message.
 /// - If no real user messages remain, insert before the compaction summary so
 ///   the summary stays last.
 /// - If there are no user messages, insert before the last compaction item so
@@ -557,6 +569,16 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
     let mut last_user_or_summary_index = None;
     let mut last_real_user_index = None;
     for (i, item) in compacted_history.iter().enumerate().rev() {
+        if let ResponseItem::AgentMessage { content, .. } = item
+            && !matches!(
+                content.first(),
+                Some(AgentMessageInputContent::InputText { text })
+                    if text.starts_with("Message Type: FINAL_ANSWER\n")
+            )
+        {
+            last_real_user_index = Some(i);
+            break;
+        }
         let Some(TurnItem::UserMessage(user)) = crate::event_mapping::parse_turn_item(item) else {
             continue;
         };
@@ -699,7 +721,6 @@ async fn drain_to_completed(
         let Some(event) = maybe_event else {
             return Err(CodexErr::Stream(
                 "stream closed before response.completed".into(),
-                None,
             ));
         };
         match event {

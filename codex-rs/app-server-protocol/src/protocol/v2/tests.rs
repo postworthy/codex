@@ -73,6 +73,73 @@ fn test_absolute_path() -> AbsolutePathBuf {
 }
 
 #[test]
+fn external_agent_config_detect_response_defaults_connectors_for_older_servers() {
+    let response = serde_json::from_value::<ExternalAgentConfigDetectResponse>(json!({
+        "items": [],
+    }))
+    .expect("older detect response should deserialize");
+
+    assert_eq!(
+        response,
+        ExternalAgentConfigDetectResponse {
+            items: Vec::new(),
+            connectors: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn thread_background_terminals_list_response_round_trips_foreign_paths() {
+    for (uri, expected_cwd) in [
+        ("file:///home/alice/repo", "/home/alice/repo"),
+        (
+            "file:///C:/Users/Alice%20Smith/repo",
+            r"C:\Users\Alice Smith\repo",
+        ),
+        ("file://server/share/repo", r"\\server\share\repo"),
+    ] {
+        let response = ThreadBackgroundTerminalsListResponse {
+            data: vec![ThreadBackgroundTerminal {
+                item_id: "item_123".to_string(),
+                process_id: "42".to_string(),
+                command: "run server".to_string(),
+                cwd: PathUri::parse(uri)
+                    .expect("cross-platform path URI should parse")
+                    .into(),
+                os_pid: None,
+                cpu_percent: None,
+                rss_kb: None,
+            }],
+            next_cursor: None,
+        };
+        let expected = json!({
+            "data": [{
+                "itemId": "item_123",
+                "processId": "42",
+                "command": "run server",
+                "cwd": expected_cwd,
+                "osPid": null,
+                "cpuPercent": null,
+                "rssKb": null,
+            }],
+            "nextCursor": null,
+        });
+
+        assert_eq!(
+            serde_json::to_value(&response).expect("response should serialize"),
+            expected,
+            "serializing {uri}",
+        );
+        assert_eq!(
+            serde_json::from_value::<ThreadBackgroundTerminalsListResponse>(expected)
+                .expect("response should deserialize"),
+            response,
+            "deserializing {uri}",
+        );
+    }
+}
+
+#[test]
 fn thread_sources_round_trip_as_scalar_labels() {
     for (source, label) in [
         (ThreadSource::User, "user"),
@@ -185,6 +252,11 @@ fn thread_resume_response_round_trips_initial_turns_page() {
             parent_thread_id: None,
             preview: String::new(),
             ephemeral: false,
+            section: Some(ThreadSection {
+                id: "01984de2-8f74-7c91-a3b2-5c5e937cf318".to_string(),
+                name: "Pinned".to_string(),
+            }),
+            section_entered_at: Some(1),
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
             created_at: 1,
@@ -225,6 +297,26 @@ fn thread_resume_response_round_trips_initial_turns_page() {
     };
 
     let value = serde_json::to_value(&response).expect("serialize thread resume response");
+    assert_eq!(
+        value["thread"]["section"],
+        json!({
+            "id": "01984de2-8f74-7c91-a3b2-5c5e937cf318",
+            "name": "Pinned",
+        })
+    );
+    assert_eq!(value["thread"]["sectionEnteredAt"], json!(1));
+
+    let mut legacy_thread = value["thread"].clone();
+    let legacy_thread_fields = legacy_thread
+        .as_object_mut()
+        .expect("serialized thread should be an object");
+    legacy_thread_fields.remove("section");
+    legacy_thread_fields.remove("sectionEnteredAt");
+    let legacy_thread =
+        serde_json::from_value::<Thread>(legacy_thread).expect("deserialize legacy thread");
+    assert_eq!(legacy_thread.section, None);
+    assert_eq!(legacy_thread.section_entered_at, None);
+
     assert_eq!(
         value.get("initialTurnsPage"),
         Some(&json!({
@@ -354,6 +446,92 @@ fn thread_list_params_accepts_state_db_only_flag() {
     .expect("state db only flag should deserialize");
 
     assert!(params.use_state_db_only);
+}
+
+#[test]
+fn thread_list_params_accepts_section_id_filter() {
+    for section_id in [
+        "01984de2-8f74-7c91-a3b2-5c5e937cf318",
+        "01984de2-8f74-7c91-a3b2-5c5e937cf319",
+    ] {
+        let params = serde_json::from_value::<ThreadListParams>(json!({
+            "sectionId": section_id,
+        }))
+        .expect("section ID filter should deserialize");
+
+        assert_eq!(
+            params.section_id.as_ref().map(|section| section.as_deref()),
+            Some(Some(section_id))
+        );
+        assert_eq!(
+            serde_json::to_value(&params)
+                .expect("section ID filter should serialize")
+                .get("sectionId"),
+            Some(&json!(section_id))
+        );
+    }
+
+    let params = serde_json::from_value::<ThreadListParams>(json!({
+        "sectionId": null,
+    }))
+    .expect("unsectioned thread filter should deserialize");
+    assert_eq!(params.section_id, Some(None));
+    assert_eq!(
+        serde_json::to_value(&params)
+            .expect("unsectioned thread filter should serialize")
+            .get("sectionId"),
+        Some(&json!(null))
+    );
+
+    let params = serde_json::from_value::<ThreadListParams>(json!({}))
+        .expect("omitted section ID filter should deserialize");
+    assert_eq!(params.section_id, None);
+    assert!(
+        serde_json::to_value(&params)
+            .expect("omitted section ID filter should serialize")
+            .get("sectionId")
+            .is_none()
+    );
+}
+
+#[test]
+fn thread_section_list_params_and_response_round_trip() {
+    let params = serde_json::from_value::<ThreadSectionListParams>(json!({
+        "cursor": "section-cursor",
+        "limit": 25,
+    }))
+    .expect("section list parameters should deserialize");
+    assert_eq!(
+        params,
+        ThreadSectionListParams {
+            cursor: Some("section-cursor".to_string()),
+            limit: Some(25),
+        }
+    );
+
+    let response = ThreadSectionListResponse {
+        data: vec![ThreadSection {
+            id: "01984de2-8f74-7c91-a3b2-5c5e937cf318".to_string(),
+            name: "Pinned".to_string(),
+        }],
+        next_cursor: None,
+    };
+    let value = serde_json::to_value(&response).expect("section list should serialize");
+    assert_eq!(
+        value,
+        json!({
+            "data": [{
+                "id": "01984de2-8f74-7c91-a3b2-5c5e937cf318",
+                "name": "Pinned",
+            }],
+            "nextCursor": null,
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<ThreadSectionListResponse>(value)
+            .expect("section list should deserialize"),
+        response
+    );
 }
 
 #[test]
@@ -1804,6 +1982,7 @@ fn config_requirements_granular_allowed_approval_policy_is_marked_experimental()
             allow_appshots: None,
             allow_remote_control: None,
             computer_use: None,
+            browser_use: None,
             feature_requirements: None,
             hooks: None,
             enforce_residency: None,
@@ -1940,13 +2119,10 @@ fn client_request_turn_start_granular_approval_policy_is_marked_experimental() {
 
 #[test]
 fn mcp_server_elicitation_response_round_trips_rmcp_result() {
-    let rmcp_result = rmcp::model::CreateElicitationResult {
-        action: rmcp::model::ElicitationAction::Accept,
-        content: Some(json!({
+    let rmcp_result = rmcp::model::ElicitResult::new(rmcp::model::ElicitationAction::Accept)
+        .with_content(json!({
             "confirmed": true,
-        })),
-        meta: None,
-    };
+        }));
 
     let v2_response = McpServerElicitationRequestResponse::from(rmcp_result.clone());
     assert_eq!(
@@ -1959,10 +2135,7 @@ fn mcp_server_elicitation_response_round_trips_rmcp_result() {
             meta: None,
         }
     );
-    assert_eq!(
-        rmcp::model::CreateElicitationResult::from(v2_response),
-        rmcp_result
-    );
+    assert_eq!(rmcp::model::ElicitResult::from(v2_response), rmcp_result);
 }
 
 #[test]
@@ -2156,6 +2329,45 @@ fn mcp_elicitation_schema_matches_mcp_2025_11_25_primitives() {
 }
 
 #[test]
+fn mcp_elicitation_preserves_integer_and_number_schema_wire_values() {
+    for (number_type, expected_type, expected_minimum, expected_maximum, expected_default) in [
+        (
+            McpElicitationNumberType::Integer,
+            "integer",
+            json!(1),
+            json!(99),
+            json!(30),
+        ),
+        (
+            McpElicitationNumberType::Number,
+            "number",
+            json!(1.0),
+            json!(99.0),
+            json!(30.0),
+        ),
+    ] {
+        let schema = McpElicitationPrimitiveSchema::Number(McpElicitationNumberSchema {
+            type_: number_type,
+            title: None,
+            description: None,
+            minimum: Some(1.0),
+            maximum: Some(99.0),
+            default: Some(30.0),
+        });
+
+        assert_eq!(
+            serde_json::to_value(schema).expect("numeric elicitation schema must serialize"),
+            json!({
+                "type": expected_type,
+                "minimum": expected_minimum,
+                "maximum": expected_maximum,
+                "default": expected_default,
+            })
+        );
+    }
+}
+
+#[test]
 fn mcp_server_elicitation_request_rejects_null_core_form_schema() {
     let result = McpServerElicitationRequest::try_from(CoreElicitationRequest::Form {
         meta: Some(json!({
@@ -2213,7 +2425,7 @@ fn mcp_server_status_serializes_absent_server_info_as_null() {
             tools: HashMap::new(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
-            auth_status: McpAuthStatus::Unsupported,
+            auth_status: McpAuthStatus::Unknown,
         }],
         next_cursor: None,
     };
@@ -2227,7 +2439,7 @@ fn mcp_server_status_serializes_absent_server_info_as_null() {
                 "tools": {},
                 "resources": [],
                 "resourceTemplates": [],
-                "authStatus": "unsupported",
+                "authStatus": "unknown",
             }],
             "nextCursor": null,
         })
@@ -2712,6 +2924,8 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
 
     let command_item = TurnItem::CommandExecution(CommandExecutionItem {
         id: "exec-1".to_string(),
+        plugin_id: Some("sample@openai-curated".to_string()),
+        script_path: Some("scripts/run.py".to_string()),
         process_id: Some("pid-1".to_string()),
         command: vec!["echo".to_string(), "done".to_string()],
         cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
@@ -2733,6 +2947,8 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         ThreadItem::from(command_item),
         ThreadItem::CommandExecution {
             id: "exec-1".to_string(),
+            plugin_id: Some("sample@openai-curated".to_string()),
+            script_path: Some("scripts/run.py".to_string()),
             command: "echo done".to_string(),
             cwd: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp").abs()),
             process_id: Some("pid-1".to_string()),
@@ -2944,6 +3160,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         app_name: Some("Calendar".to_string()),
         action_name: Some("create_event".to_string()),
         plugin_id: Some("sample@test".to_string()),
+        read_only_hint: Some(true),
         status: CoreMcpToolCallStatus::InProgress,
         result: None,
         error: None,
@@ -2967,6 +3184,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             }),
             mcp_app_resource_uri: Some("app://connector".to_string()),
             plugin_id: Some("sample@test".to_string()),
+            read_only_hint: Some(true),
             result: None,
             error: None,
             duration_ms: None,
@@ -2984,6 +3202,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         app_name: None,
         action_name: None,
         plugin_id: None,
+        read_only_hint: Some(false),
         status: CoreMcpToolCallStatus::Completed,
         result: Some(CallToolResult {
             content: vec![json!({"type": "text", "text": "ok"})],
@@ -3006,6 +3225,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             app_context: None,
             mcp_app_resource_uri: None,
             plugin_id: None,
+            read_only_hint: Some(false),
             result: Some(Box::new(McpToolCallResult {
                 content: vec![json!({"type": "text", "text": "ok"})],
                 structured_content: Some(json!({"ok": true})),
@@ -3034,6 +3254,7 @@ fn mcp_tool_call_app_context_serializes_connector_id() {
         }),
         mcp_app_resource_uri: Some("app://connector".to_string()),
         plugin_id: None,
+        read_only_hint: Some(false),
         result: None,
         error: None,
         duration_ms: None,
@@ -3057,6 +3278,7 @@ fn mcp_tool_call_app_context_serializes_connector_id() {
             },
             "mcpAppResourceUri": "app://connector",
             "pluginId": null,
+            "readOnlyHint": false,
             "result": null,
             "error": null,
             "durationMs": null,
@@ -3648,11 +3870,13 @@ fn plugin_share_params_and_response_serialization_use_camel_case_fields() {
         serde_json::to_value(PluginShareSaveResponse {
             remote_plugin_id: "plugins~Plugin_00000000000000000000000000000000".to_string(),
             share_url: String::new(),
+            can_publish_to_workspace: Some(true),
         })
         .unwrap(),
         json!({
             "remotePluginId": "plugins~Plugin_00000000000000000000000000000000",
             "shareUrl": "",
+            "canPublishToWorkspace": true,
         }),
     );
 
@@ -3778,12 +4002,15 @@ fn plugin_share_list_response_serializes_share_items() {
                     share_context: None,
                     source: PluginSource::Remote,
                     installed: false,
+                    installed_at: None,
                     enabled: false,
                     install_policy: PluginInstallPolicy::Available,
                     install_policy_source: Some(PluginInstallPolicySource::WorkspaceSetting),
                     must_show_installation_interstitial: None,
                     auth_policy: PluginAuthPolicy::OnUse,
                     availability: PluginAvailability::Available,
+                    disabled_reason: None,
+                    eligible_plan_types: None,
                     interface: None,
                     keywords: Vec::new(),
                 },
@@ -3802,12 +4029,15 @@ fn plugin_share_list_response_serializes_share_items() {
                     "shareContext": null,
                     "source": { "type": "remote" },
                     "installed": false,
+                    "installedAt": null,
                     "enabled": false,
                     "installPolicy": "AVAILABLE",
                     "installPolicySource": "WORKSPACE_SETTING",
                     "mustShowInstallationInterstitial": null,
                     "authPolicy": "ON_USE",
                     "availability": "AVAILABLE",
+                    "disabledReason": null,
+                    "eligiblePlanTypes": null,
                     "interface": null,
                     "keywords": [],
                 },
@@ -3832,9 +4062,48 @@ fn plugin_summary_defaults_missing_availability_to_available() {
     .unwrap();
 
     assert_eq!(summary.availability, PluginAvailability::Available);
+    assert_eq!(summary.installed_at, None);
     assert_eq!(summary.local_version, None);
     assert_eq!(summary.share_context, None);
     assert_eq!(summary.must_show_installation_interstitial, None);
+    assert_eq!(summary.disabled_reason, None);
+    assert_eq!(summary.eligible_plan_types, None);
+}
+
+#[test]
+fn plugin_summary_round_trips_plan_eligibility_metadata() {
+    let value = json!({
+        "id": "gmail@openai-curated-remote",
+        "remotePluginId": "plugins~Plugin_00000000000000000000000000000000",
+        "version": null,
+        "localVersion": null,
+        "name": "gmail",
+        "shareContext": null,
+        "source": { "type": "remote" },
+        "installed": false,
+        "installedAt": null,
+        "enabled": false,
+        "installPolicy": "NOT_AVAILABLE",
+        "installPolicySource": null,
+        "mustShowInstallationInterstitial": null,
+        "authPolicy": "ON_USE",
+        "availability": "DISABLED_BY_ADMIN",
+        "disabledReason": "plan_not_eligible",
+        "eligiblePlanTypes": ["plus", "pro", "enterprise_cbp_automation"],
+        "interface": null,
+        "keywords": [],
+    });
+    let summary: PluginSummary =
+        serde_json::from_value(value.clone()).expect("plan metadata should deserialize");
+
+    assert_eq!(
+        summary.disabled_reason,
+        Some(PluginDisabledReason::PlanNotEligible)
+    );
+    assert_eq!(
+        serde_json::to_value(summary).expect("plan metadata should serialize"),
+        value
+    );
 }
 
 #[test]
@@ -4461,4 +4730,71 @@ fn realtime_start_omitted_initial_items_remain_none() {
     .expect("params should deserialize");
 
     assert_eq!(params.initial_items, None);
+}
+#[test]
+fn realtime_start_deserializes_client_handoff_channel_prefixes() {
+    let params = serde_json::from_value::<ThreadRealtimeStartParams>(json!({
+        "threadId": "thread_123",
+        "outputModality": "audio",
+        "codexResponseHandoffChannelPrefixes": {
+            "analysis": ["[THINKING]"],
+            "commentary": ["[PROGRESS]", "[UPDATE]"],
+            "final": ["[DONE]"]
+        }
+    }))
+    .expect("params should deserialize");
+
+    assert_eq!(
+        params.codex_response_handoff_channel_prefixes,
+        Some(BTreeMap::from([
+            ("analysis".to_string(), vec!["[THINKING]".to_string()]),
+            (
+                "commentary".to_string(),
+                vec!["[PROGRESS]".to_string(), "[UPDATE]".to_string()],
+            ),
+            ("final".to_string(), vec!["[DONE]".to_string()]),
+        ]))
+    );
+}
+
+#[test]
+fn tool_request_user_input_params_default_legacy_missing_is_blocking_to_true() {
+    let params = serde_json::from_value::<ToolRequestUserInputParams>(json!({
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "itemId": "call-1",
+        "questions": [{
+            "id": "q1",
+            "header": "Confirm",
+            "question": "Continue?",
+            "options": [{
+                "label": "Yes",
+                "description": "Continue."
+            }]
+        }],
+        "autoResolutionMs": 60_000
+    }))
+    .expect("legacy request_user_input params should deserialize");
+
+    assert_eq!(
+        params,
+        ToolRequestUserInputParams {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "call-1".to_string(),
+            questions: vec![ToolRequestUserInputQuestion {
+                id: "q1".to_string(),
+                header: "Confirm".to_string(),
+                question: "Continue?".to_string(),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![ToolRequestUserInputOption {
+                    label: "Yes".to_string(),
+                    description: "Continue.".to_string(),
+                }]),
+            }],
+            is_blocking: true,
+            auto_resolution_ms: Some(60_000),
+        }
+    );
 }
