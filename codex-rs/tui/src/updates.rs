@@ -112,9 +112,7 @@ async fn check_for_update(
         Some(UpdateAction::StandaloneUnix)
         | Some(UpdateAction::StandaloneWindows)
         | Some(UpdateAction::SourceGit { .. })
-        | None => {
-            fetch_latest_github_release_version(&client_pool).await?
-        }
+        | None => fetch_latest_github_release_version(&client_pool).await?,
     };
 
     // Preserve any previously dismissed version if present.

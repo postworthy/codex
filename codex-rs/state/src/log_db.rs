@@ -701,9 +701,12 @@ mod tests {
     #[tokio::test]
     async fn sqlite_log_filter_defaults_to_info() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let layer = LogDbLayer::start_with_config(
             runtime.clone(),
             LogSinkQueueConfig {
@@ -747,9 +750,12 @@ mod tests {
     #[tokio::test]
     async fn sqlite_log_filter_respects_rust_log_directives() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let layer = LogDbLayer::start_with_config(
             runtime.clone(),
             LogSinkQueueConfig {

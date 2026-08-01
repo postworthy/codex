@@ -102,6 +102,7 @@ fn agent_assisted_update_command(
     );
     let mut command = Command::new(codex_bin);
     command
+        .arg("exec")
         .arg("--cd")
         .arg(build_dir)
         .arg("-c")

@@ -19,15 +19,16 @@ fn agent_assisted_update_runs_codex_in_checkout_with_failure_context() {
     assert_eq!(command.get_program(), codex_bin.as_os_str());
     assert_eq!(command.get_current_dir(), Some(build_dir));
     assert_eq!(
-        &args[..4],
+        &args[..5],
         &[
+            OsString::from("exec"),
             OsString::from("--cd"),
             build_dir.as_os_str().to_os_string(),
             OsString::from("-c"),
             OsString::from("check_for_update_on_startup=false"),
         ]
     );
-    let prompt = args[4].to_string_lossy();
+    let prompt = args[5].to_string_lossy();
     assert!(prompt.contains("Repository: /work/codex"));
     assert!(prompt.contains("Target Codex release: 0.145.0"));
     assert!(prompt.contains(
