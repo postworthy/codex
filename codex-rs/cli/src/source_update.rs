@@ -56,11 +56,20 @@ fn try_source_git_update(build_dir: &Path, latest_version: &str) -> anyhow::Resu
     let layout = install::SourceInstallLayout::for_environment(&target)?;
     let _lock = install::SourceUpdateLock::acquire(&layout)?;
     install::prepare_staging_dir(&layout)?;
+    let system_bwrap = target
+        .contains("linux")
+        .then(codex_sandboxing::find_system_bwrap_in_path)
+        .flatten();
     let build_result = run_checked_command(
-        source_package_build_command(build_dir, layout.staging_dir(), &target)
-            .env("CODEX_CLI_DISPLAY_VERSION", display_version)
-            .env("CODEX_CLI_BUILD_DIR", build_dir)
-            .env("CODEX_CLI_UPDATE_BASE_VERSION", latest_version),
+        source_package_build_command(
+            build_dir,
+            layout.staging_dir(),
+            &target,
+            system_bwrap.as_deref(),
+        )
+        .env("CODEX_CLI_DISPLAY_VERSION", display_version)
+        .env("CODEX_CLI_BUILD_DIR", build_dir)
+        .env("CODEX_CLI_UPDATE_BASE_VERSION", latest_version),
         "build Codex source package",
     );
     if let Err(error) = build_result {
@@ -71,7 +80,12 @@ fn try_source_git_update(build_dir: &Path, latest_version: &str) -> anyhow::Resu
 }
 
 #[cfg(not(windows))]
-fn source_package_build_command(build_dir: &Path, package_dir: &Path, target: &str) -> Command {
+fn source_package_build_command(
+    build_dir: &Path,
+    package_dir: &Path,
+    target: &str,
+    system_bwrap: Option<&Path>,
+) -> Command {
     let mut command = Command::new("python3");
     command
         .arg(build_dir.join("scripts/build_codex_package.py"))
@@ -83,6 +97,9 @@ fn source_package_build_command(build_dir: &Path, package_dir: &Path, target: &s
         .arg(package_dir)
         .arg("--force")
         .current_dir(build_dir);
+    if let Some(system_bwrap) = system_bwrap {
+        command.arg("--bwrap-bin").arg(system_bwrap);
+    }
     command
 }
 

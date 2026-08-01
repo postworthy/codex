@@ -44,7 +44,13 @@ fn source_package_build_uses_supported_packaging_path() {
     let build_dir = Path::new("/work/codex");
     let package_dir = Path::new("/work/codex/codex-rs/target/source-update-package");
 
-    let command = source_package_build_command(build_dir, package_dir, "x86_64-unknown-linux-gnu");
+    let bwrap = Path::new("/usr/bin/bwrap");
+    let command = source_package_build_command(
+        build_dir,
+        package_dir,
+        "x86_64-unknown-linux-gnu",
+        Some(bwrap),
+    );
     let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
 
     assert_eq!(command.get_program(), "python3");
@@ -60,6 +66,8 @@ fn source_package_build_uses_supported_packaging_path() {
             OsString::from("--package-dir"),
             package_dir.as_os_str().to_os_string(),
             OsString::from("--force"),
+            OsString::from("--bwrap-bin"),
+            bwrap.as_os_str().to_os_string(),
         ]
     );
 }
