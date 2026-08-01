@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -50,6 +51,29 @@ fn installs_complete_packages_atomically_and_retains_two_releases() {
         .collect::<Result<Vec<_>, _>>()
         .expect("release entries");
     assert_eq!(releases.len(), 2);
+}
+
+#[test]
+fn retention_stays_bounded_when_current_release_sorts_before_old_releases() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let source_root = temp_dir.path().join("source");
+    let bin_dir = temp_dir.path().join("bin");
+
+    for release_name in ["source-bootstrap-01", "source-bootstrap-02", "source-03"] {
+        let layout = SourceInstallLayout::new(&source_root, &bin_dir, release_name);
+        write_package(layout.staging_dir(), TARGET, release_name);
+        install_source_package_with(&layout, TARGET, |_| Ok(())).expect("install package");
+    }
+
+    let mut releases = std::fs::read_dir(source_root.join("releases"))
+        .expect("releases")
+        .map(|entry| entry.expect("release entry").file_name())
+        .collect::<Vec<_>>();
+    releases.sort();
+    assert_eq!(
+        releases,
+        ["source-03", "source-bootstrap-02"].map(OsString::from)
+    );
 }
 
 #[test]

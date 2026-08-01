@@ -368,10 +368,12 @@ fn prune_old_releases(layout: &SourceInstallLayout) -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     releases.sort_by_key(std::fs::DirEntry::file_name);
     let remove_count = releases.len().saturating_sub(MAX_RETAINED_RELEASES);
-    for release in releases.into_iter().take(remove_count) {
-        if release.path() != layout.release_dir {
-            std::fs::remove_dir_all(release.path())?;
-        }
+    for release in releases
+        .into_iter()
+        .filter(|release| release.path() != layout.release_dir)
+        .take(remove_count)
+    {
+        std::fs::remove_dir_all(release.path())?;
     }
     Ok(())
 }
