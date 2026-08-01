@@ -86,7 +86,7 @@ impl UpdateAction {
             } => {
                 let build_dir = build_dir.display();
                 format!(
-                    "cd {build_dir} && git fetch upstream main && git merge --no-edit upstream/main && CODEX_CLI_UPDATE_BASE_VERSION={latest_version} cargo build --release --bin codex"
+                    "source checkout {build_dir}: merge upstream/main, build and atomically install the complete Codex package (release baseline {latest_version})"
                 )
             }
             _ => unreachable!("non-source update actions have static command args"),
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(action.command_args(), None);
         assert_eq!(
             action.command_str(),
-            "cd /tmp/codex && git fetch upstream main && git merge --no-edit upstream/main && CODEX_CLI_UPDATE_BASE_VERSION=0.136.0 cargo build --release --bin codex"
+            "source checkout /tmp/codex: merge upstream/main, build and atomically install the complete Codex package (release baseline 0.136.0)"
         );
     }
 }
