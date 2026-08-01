@@ -52,19 +52,48 @@ fn try_source_git_update(build_dir: &Path, latest_version: &str) -> anyhow::Resu
     ensure_source_checkout_clean(build_dir)?;
     sync_source_checkout(build_dir)?;
     let display_version = source_update_display_version(latest_version);
+    let package_dir = build_dir
+        .join("codex-rs")
+        .join("target/source-update-package");
+    let target = source_build_target()?;
     run_checked_command(
-        Command::new("cargo")
-            .arg("build")
-            .arg("--release")
-            .arg("--bin")
-            .arg("codex")
-            .current_dir(build_dir.join("codex-rs"))
+        source_package_build_command(build_dir, &package_dir, &target)
             .env("CODEX_CLI_DISPLAY_VERSION", display_version)
             .env("CODEX_CLI_BUILD_DIR", build_dir)
             .env("CODEX_CLI_UPDATE_BASE_VERSION", latest_version),
-        "cargo build --release --bin codex",
+        "build Codex source package",
     )?;
-    install_source_built_binary(build_dir)
+    install_source_built_binaries(&package_dir)
+}
+
+#[cfg(not(windows))]
+fn source_package_build_command(build_dir: &Path, package_dir: &Path, target: &str) -> Command {
+    let mut command = Command::new("python3");
+    command
+        .arg(build_dir.join("scripts/build_codex_package.py"))
+        .arg("--target")
+        .arg(target)
+        .arg("--cargo-profile")
+        .arg("release")
+        .arg("--package-dir")
+        .arg(package_dir)
+        .arg("--force")
+        .current_dir(build_dir);
+    command
+}
+
+#[cfg(not(windows))]
+fn source_build_target() -> anyhow::Result<String> {
+    let output = Command::new("rustc").arg("-vV").output()?;
+    if !output.status.success() {
+        anyhow::bail!("`rustc -vV` failed with status {}", output.status);
+    }
+    let version = String::from_utf8(output.stdout)?;
+    version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("`rustc -vV` output did not include a host target"))
 }
 
 #[cfg(not(windows))]
@@ -226,37 +255,67 @@ fn source_update_display_version(latest_version: &str) -> String {
 }
 
 #[cfg(not(windows))]
-fn install_source_built_binary(build_dir: &Path) -> anyhow::Result<()> {
-    let source_bin = build_dir.join("codex-rs").join("target/release/codex");
+fn install_source_built_binaries(package_dir: &Path) -> anyhow::Result<()> {
     let installed_bin = std::env::current_exe()?;
+    install_source_built_binaries_to(package_dir, &installed_bin)
+}
+
+#[cfg(not(windows))]
+fn install_source_built_binaries_to(
+    package_dir: &Path,
+    installed_bin: &Path,
+) -> anyhow::Result<()> {
     let installed_dir = installed_bin
         .parent()
         .ok_or_else(|| anyhow::anyhow!("current executable has no parent directory"))?;
+    let source_bin = package_dir.join("bin/codex");
+    let source_host = package_dir.join("bin/codex-code-mode-host");
+    let installed_host = installed_dir.join("codex-code-mode-host");
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let backup = installed_bin.with_file_name(format!(
+    let bin_backup = installed_bin.with_file_name(format!(
         "{}.bak.{timestamp}",
         installed_bin
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("codex")
     ));
-    let temp = installed_dir.join(format!(".codex-update-{timestamp}"));
+    let host_backup =
+        installed_host.with_file_name(format!("codex-code-mode-host.bak.{timestamp}"));
+    let bin_temp = installed_dir.join(format!(".codex-update-{timestamp}"));
+    let host_temp = installed_dir.join(format!(".codex-code-mode-host-update-{timestamp}"));
 
-    std::fs::copy(&installed_bin, &backup)?;
-    std::fs::copy(&source_bin, &temp)?;
-    let mut permissions = std::fs::metadata(&temp)?.permissions();
+    std::fs::copy(&source_bin, &bin_temp)?;
+    std::fs::copy(&source_host, &host_temp)?;
+    let mut bin_permissions = std::fs::metadata(&bin_temp)?.permissions();
+    let mut host_permissions = std::fs::metadata(&host_temp)?.permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o755);
+        bin_permissions.set_mode(0o755);
+        host_permissions.set_mode(0o755);
     }
-    std::fs::set_permissions(&temp, permissions)?;
-    std::fs::rename(&temp, &installed_bin)?;
+    std::fs::set_permissions(&bin_temp, bin_permissions)?;
+    std::fs::set_permissions(&host_temp, host_permissions)?;
+
+    std::fs::copy(installed_bin, &bin_backup)?;
+    if installed_host.is_file() {
+        std::fs::copy(&installed_host, &host_backup)?;
+    }
+    std::fs::rename(&host_temp, &installed_host)?;
+    std::fs::rename(&bin_temp, installed_bin)?;
+
     println!("Installed updated binary to {}", installed_bin.display());
-    println!("Previous binary backed up to {}", backup.display());
+    println!("Installed code-mode host to {}", installed_host.display());
+    println!("Previous binary backed up to {}", bin_backup.display());
+    if host_backup.is_file() {
+        println!(
+            "Previous code-mode host backed up to {}",
+            host_backup.display()
+        );
+    }
     Ok(())
 }
 
