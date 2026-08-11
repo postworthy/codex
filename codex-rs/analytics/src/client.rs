@@ -9,6 +9,8 @@ use crate::facts::AnalyticsJsonRpcError;
 use crate::facts::AppInvocation;
 use crate::facts::AppMentionedInput;
 use crate::facts::AppUsedInput;
+use crate::facts::ArtifactOperation;
+use crate::facts::ArtifactOperationInput;
 use crate::facts::CodexGoalEvent;
 use crate::facts::CustomAnalyticsFact;
 use crate::facts::ExternalAgentConfigImportCompletedInput;
@@ -141,6 +143,9 @@ impl AnalyticsEventsQueue {
                 let input = match input {
                     AnalyticsEventsQueueMessage::Fact(input) => *input,
                     AnalyticsEventsQueueMessage::Flush(done_tx) => {
+                        let mut events = Vec::new();
+                        reducer.flush(&mut events);
+                        send_track_events(&auth_manager, &destination, events).await;
                         let _ = done_tx.send(());
                         continue;
                     }
@@ -266,6 +271,19 @@ impl AnalyticsEventsClient {
         )));
     }
 
+    pub fn track_artifact_operation(
+        &self,
+        tracking: TrackEventsContext,
+        operation: ArtifactOperation,
+    ) {
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::ArtifactOperation(ArtifactOperationInput {
+                tracking,
+                operation,
+            }),
+        ));
+    }
+
     pub fn track_initialize(
         &self,
         connection_id: u64,
@@ -285,6 +303,12 @@ impl AnalyticsEventsClient {
     pub fn track_subagent_thread_started(&self, input: SubAgentThreadStartedInput) {
         self.record_fact(AnalyticsFact::Custom(
             CustomAnalyticsFact::SubAgentThreadStarted(input),
+        ));
+    }
+
+    pub fn track_code_mode_tool_call(&self, input: crate::facts::CodeModeToolCallFact) {
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::CodeModeToolCall(input),
         ));
     }
 
@@ -607,7 +631,10 @@ impl AnalyticsEventsClient {
     pub fn track_notification(&self, notification: &ServerNotification) {
         if !matches!(
             notification,
-            ServerNotification::TurnStarted(_)
+            ServerNotification::ThreadArchived(_)
+                | ServerNotification::ThreadClosed(_)
+                | ServerNotification::ThreadUnarchived(_)
+                | ServerNotification::TurnStarted(_)
                 | ServerNotification::TurnCompleted(_)
                 | ServerNotification::TurnDiffUpdated(_)
                 | ServerNotification::ItemStarted(_)

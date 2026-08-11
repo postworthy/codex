@@ -1,11 +1,13 @@
 mod agents_md;
 mod apps_instructions;
 mod collaboration_mode;
+mod compact_permissions;
 mod context_window_guidance;
 mod environment;
 mod environments_instructions;
 mod model;
 mod multi_agent_mode;
+mod multi_agent_usage_hint;
 mod permissions;
 mod personality;
 mod plugins_instructions;
@@ -33,11 +35,13 @@ use std::fmt;
 pub(crate) use agents_md::AgentsMdState;
 pub(crate) use apps_instructions::AppsInstructionsState;
 pub(crate) use collaboration_mode::CollaborationModeState;
+pub(crate) use compact_permissions::CompactPermissionsState;
 pub(crate) use context_window_guidance::ContextWindowGuidanceState;
 pub(crate) use environment::EnvironmentsState;
 pub(crate) use environments_instructions::EnvironmentsInstructionsState;
 pub(crate) use model::ModelInstructionsState;
 pub(crate) use multi_agent_mode::MultiAgentModeState;
+pub(crate) use multi_agent_usage_hint::MultiAgentUsageHintState;
 pub(crate) use permissions::PermissionsState;
 pub(crate) use personality::PersonalityState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
@@ -87,7 +91,7 @@ impl<S: WorldStateSection> ErasedWorldStateSection for S {
     }
 
     fn matches_legacy_fragment(&self, role: &str, text: &str) -> bool {
-        S::matches_legacy_fragment(role, text)
+        WorldStateSection::matches_current_legacy_fragment(self, role, text)
     }
 
     fn has_retained_fragment_matcher(&self) -> bool {
@@ -215,6 +219,11 @@ pub(crate) trait WorldStateSection: Send + Sync + 'static {
 
     fn matches_legacy_fragment(_role: &str, _text: &str) -> bool {
         false
+    }
+
+    /// Recognizes legacy fragments whose identity depends on this section's current value.
+    fn matches_current_legacy_fragment(&self, role: &str, text: &str) -> bool {
+        Self::matches_legacy_fragment(role, text)
     }
 
     /// Whether retained history must still contain this section's rendered fragment.
@@ -352,20 +361,21 @@ impl WorldState {
     }
 
     /// Falls back to retained model history when no exact persisted snapshot is available.
-    pub(crate) fn render_history_diff(
+    pub(crate) fn render_history_diff<'a>(
         &self,
         previous: Option<&WorldStateSnapshot>,
-        items: &[ResponseItem],
+        items: impl IntoIterator<Item = &'a ResponseItem> + Clone,
     ) -> Vec<Box<dyn ContextualUserFragment>> {
         self.render_with(|id, section| {
             if let Some(previous) = previous.and_then(|previous| previous.sections.get(id)) {
-                if section.has_retained_fragment_matcher() && !has_retained_fragment(items, section)
+                if section.has_retained_fragment_matcher()
+                    && !has_retained_fragment(items.clone(), section)
                 {
                     PreviousSectionState::Absent
                 } else {
                     PreviousSectionState::Known(previous)
                 }
-            } else if has_legacy_fragment(items, section) {
+            } else if has_legacy_fragment(items.clone(), section) {
                 PreviousSectionState::Unknown
             } else {
                 PreviousSectionState::Absent
@@ -384,8 +394,11 @@ impl WorldState {
     }
 }
 
-fn has_retained_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateSection) -> bool {
-    items.iter().any(|item| {
+fn has_retained_fragment<'a>(
+    items: impl IntoIterator<Item = &'a ResponseItem>,
+    section: &dyn ErasedWorldStateSection,
+) -> bool {
+    items.into_iter().any(|item| {
         matches!(
             item,
             ResponseItem::Message { role, content, .. }
@@ -400,8 +413,11 @@ fn has_retained_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateS
     })
 }
 
-fn has_legacy_fragment(items: &[ResponseItem], section: &dyn ErasedWorldStateSection) -> bool {
-    items.iter().any(|item| {
+fn has_legacy_fragment<'a>(
+    items: impl IntoIterator<Item = &'a ResponseItem>,
+    section: &dyn ErasedWorldStateSection,
+) -> bool {
+    items.into_iter().any(|item| {
         matches!(
             item,
             ResponseItem::Message { role, content, .. }
