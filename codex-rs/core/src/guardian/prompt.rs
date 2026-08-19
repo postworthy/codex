@@ -9,6 +9,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::compact::content_items_to_text;
+use crate::context::NodeReplReviewEvidence;
+use crate::context::NodeReplReviewEvidenceMode;
+use crate::context::node_repl_review_evidence_mode;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnEnvironment;
@@ -22,6 +25,7 @@ use super::AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX;
 use super::ApprovalRequestReasons;
 use super::GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS;
 use super::GUARDIAN_MAX_MESSAGE_TRANSCRIPT_TOKENS;
+use super::GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKENS;
 use super::GUARDIAN_MAX_TOOL_ENTRY_TOKENS;
 use super::GUARDIAN_MAX_TOOL_TRANSCRIPT_TOKENS;
 use super::GUARDIAN_RECENT_ENTRY_LIMIT;
@@ -46,6 +50,7 @@ pub(crate) enum GuardianTranscriptEntryKind {
     User,
     Assistant,
     Tool(String),
+    NodeReplToolResult(String),
 }
 
 impl GuardianTranscriptEntryKind {
@@ -54,7 +59,7 @@ impl GuardianTranscriptEntryKind {
             Self::Developer => "developer",
             Self::User => "user",
             Self::Assistant => "assistant",
-            Self::Tool(role) => role.as_str(),
+            Self::Tool(role) | Self::NodeReplToolResult(role) => role.as_str(),
         }
     }
 
@@ -63,13 +68,14 @@ impl GuardianTranscriptEntryKind {
     }
 
     fn is_tool(&self) -> bool {
-        matches!(self, Self::Tool(_))
+        matches!(self, Self::Tool(_) | Self::NodeReplToolResult(_))
     }
 }
 
 pub(crate) struct GuardianPromptItems {
     pub(crate) items: Vec<UserInput>,
     pub(crate) transcript_cursor: GuardianTranscriptCursor,
+    pub(crate) node_repl_evidence_sequence: u64,
     pub(crate) reviewed_action_truncated: bool,
 }
 
@@ -110,6 +116,7 @@ pub(crate) async fn build_guardian_prompt_items(
         },
         request,
         mode,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
     )
     .await
 }
@@ -120,7 +127,17 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     reasons: ApprovalRequestReasons,
     request: GuardianApprovalRequest,
     mode: GuardianPromptMode,
+    reviewed_node_repl_evidence_sequence: u64,
 ) -> serde_json::Result<GuardianPromptItems> {
+    let evidence_mode = parent_context
+        .map(|context| node_repl_review_evidence_mode(context.turn()))
+        .unwrap_or(NodeReplReviewEvidenceMode::Disabled);
+    let node_repl_transcripts_enabled = evidence_mode != NodeReplReviewEvidenceMode::Disabled;
+    let node_repl_result_token_limit = if node_repl_transcripts_enabled {
+        GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKENS
+    } else {
+        GUARDIAN_MAX_TOOL_ENTRY_TOKENS
+    };
     let history = session.clone_history().await;
     let transcript_entries = collect_guardian_transcript_entries(history.raw_items());
     let transcript_cursor = GuardianTranscriptCursor {
@@ -146,7 +163,12 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     let (transcript_entries, omission_note, headings) = match prompt_shape {
         GuardianPromptShape::Full => {
             let (transcript_entries, omission_note) =
-                render_guardian_transcript_entries(transcript_entries.as_slice());
+                render_guardian_transcript_entries_with_offset(
+                    transcript_entries.as_slice(),
+                    /*entry_number_offset*/ 0,
+                    "<no retained transcript entries>",
+                    node_repl_result_token_limit,
+                );
             (
                 transcript_entries,
                 omission_note,
@@ -166,6 +188,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
                     &transcript_entries[already_seen_entry_count..],
                     already_seen_entry_count,
                     "<no retained transcript delta entries>",
+                    node_repl_result_token_limit,
                 );
             (
                 transcript_entries,
@@ -206,6 +229,23 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
         push_text(denied_reads_context);
         push_text(">>> PARENT TURN PERMISSION CONTEXT END\n".to_string());
     }
+    let mut node_repl_evidence_sequence = reviewed_node_repl_evidence_sequence;
+    if node_repl_transcripts_enabled
+        && let Some(fragment) = session
+            .services
+            .thread_extension_data
+            .get::<NodeReplReviewEvidence>()
+            .and_then(|evidence| evidence.snapshot_since(reviewed_node_repl_evidence_sequence))
+    {
+        node_repl_evidence_sequence = fragment.sequence;
+        items.extend(fragment.into_inputs(evidence_mode));
+    }
+    let mut push_text = |text: String| {
+        items.push(UserInput::Text {
+            text,
+            text_elements: Vec::new(),
+        });
+    };
     match &request {
         GuardianApprovalRequest::NetworkAccess { trigger, .. } => {
             push_text(">>> APPROVAL REQUEST START\n".to_string());
@@ -250,6 +290,7 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
     Ok(GuardianPromptItems {
         items,
         transcript_cursor,
+        node_repl_evidence_sequence,
         reviewed_action_truncated: planned_action_json.truncated,
     })
 }
@@ -314,6 +355,7 @@ struct GuardianPromptHeadings {
 ///
 /// Returns the rendered transcript plus an omission note when some entries were
 /// skipped.
+#[cfg(test)]
 pub(crate) fn render_guardian_transcript_entries(
     entries: &[GuardianTranscriptEntry],
 ) -> (Vec<String>, Option<String>) {
@@ -321,6 +363,7 @@ pub(crate) fn render_guardian_transcript_entries(
         entries,
         /*entry_number_offset*/ 0,
         "<no retained transcript entries>",
+        GUARDIAN_MAX_TOOL_ENTRY_TOKENS,
     )
 }
 
@@ -328,6 +371,7 @@ fn render_guardian_transcript_entries_with_offset(
     entries: &[GuardianTranscriptEntry],
     entry_number_offset: usize,
     empty_placeholder: &str,
+    node_repl_result_token_limit: usize,
 ) -> (Vec<String>, Option<String>) {
     if entries.is_empty() {
         return (vec![empty_placeholder.to_string()], None);
@@ -337,7 +381,12 @@ fn render_guardian_transcript_entries_with_offset(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let token_cap = if entry.kind.is_tool() {
+            let token_cap = if matches!(
+                entry.kind,
+                GuardianTranscriptEntryKind::NodeReplToolResult(_)
+            ) {
+                node_repl_result_token_limit
+            } else if entry.kind.is_tool() {
                 GUARDIAN_MAX_TOOL_ENTRY_TOKENS
             } else {
                 GUARDIAN_MAX_MESSAGE_ENTRY_TOKENS
@@ -486,10 +535,12 @@ pub(crate) fn collect_guardian_transcript_entries<'a>(
             ResponseItem::FunctionCall {
                 call_id,
                 name,
+                namespace,
                 arguments,
                 ..
             } => {
-                tool_names_by_call_id.insert(call_id.clone(), name.clone());
+                tool_names_by_call_id
+                    .insert(call_id.as_str(), (name.as_str(), namespace.as_deref()));
                 (!arguments.trim().is_empty()).then(|| GuardianTranscriptEntry {
                     kind: GuardianTranscriptEntryKind::Tool(format!("tool {name} call")),
                     text: arguments.clone(),
@@ -498,10 +549,12 @@ pub(crate) fn collect_guardian_transcript_entries<'a>(
             ResponseItem::CustomToolCall {
                 call_id,
                 name,
+                namespace,
                 input,
                 ..
             } => {
-                tool_names_by_call_id.insert(call_id.clone(), name.clone());
+                tool_names_by_call_id
+                    .insert(call_id.as_str(), (name.as_str(), namespace.as_deref()));
                 (!input.trim().is_empty()).then(|| GuardianTranscriptEntry {
                     kind: GuardianTranscriptEntryKind::Tool(format!("tool {name} call")),
                     text: input.clone(),
@@ -519,15 +572,27 @@ pub(crate) fn collect_guardian_transcript_entries<'a>(
             | ResponseItem::CustomToolCallOutput {
                 call_id, output, ..
             } => output.body.to_text().and_then(|text| {
-                non_empty_entry(
-                    GuardianTranscriptEntryKind::Tool(
-                        tool_names_by_call_id.get(call_id).map_or_else(
-                            || "tool result".to_string(),
-                            |name| format!("tool {name} result"),
-                        ),
-                    ),
-                    text,
-                )
+                let kind = match tool_names_by_call_id.get(call_id.as_str()) {
+                    Some((name, namespace))
+                        if matches!(
+                            namespace,
+                            Some(
+                                "mcp__node_repl" | "mcp__node_repl__" | "node_repl" | "node_repl__"
+                            )
+                        ) || namespace.is_none()
+                            && (name.starts_with("mcp__node_repl__")
+                                || name.starts_with("node_repl__")) =>
+                    {
+                        GuardianTranscriptEntryKind::NodeReplToolResult(format!(
+                            "tool {name} result"
+                        ))
+                    }
+                    Some((name, _)) => {
+                        GuardianTranscriptEntryKind::Tool(format!("tool {name} result"))
+                    }
+                    None => GuardianTranscriptEntryKind::Tool("tool result".to_string()),
+                };
+                non_empty_entry(kind, text)
             }),
             _ => None,
         };
@@ -703,7 +768,7 @@ For anything else, use this JSON schema:
 }"#
 }
 
-pub(super) const BUNDLED_GUARDIAN_POLICY: &str = include_str!("policy.md");
+pub(crate) const BUNDLED_GUARDIAN_POLICY: &str = include_str!("policy.md");
 pub(super) const BUNDLED_GUARDIAN_POLICY_TEMPLATE: &str = include_str!("policy_template.md");
 const TENANT_POLICY_CONFIG_PLACEHOLDER: &str = "{{ tenant_policy_config }}";
 

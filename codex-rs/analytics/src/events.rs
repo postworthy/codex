@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use crate::facts::AcceptedLineFingerprint;
 use crate::facts::AppInvocation;
 use crate::facts::ArtifactOperation;
 use crate::facts::ArtifactOperationLifecycle;
@@ -40,12 +39,15 @@ use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,9 +78,11 @@ pub(crate) enum TrackEventRequest {
     TurnSteer(CodexTurnSteerEventRequest),
     ArtifactOperation(CodexArtifactOperationEventRequest),
     CommandExecution(CodexCommandExecutionEventRequest),
+    PluginMeasurement(CodexPluginMeasurementEventRequest),
     FileChange(CodexFileChangeEventRequest),
     McpToolCall(CodexMcpToolCallEventRequest),
     DynamicToolCall(CodexDynamicToolCallEventRequest),
+    ControlToolCall(CodexControlToolCallEventRequest),
     CollabAgentToolCall(CodexCollabAgentToolCallEventRequest),
     WebSearch(CodexWebSearchEventRequest),
     ImageGeneration(CodexImageGenerationEventRequest),
@@ -160,6 +164,7 @@ impl TrackEventRequest {
             Self::SkillInvocation(event) => event.event_params.plugin_id.is_some(),
             Self::McpToolCall(event) => event.event_params.plugin_id.is_some(),
             Self::ArtifactOperation(event) => !event.event_params.plugin_id.is_empty(),
+            Self::PluginMeasurement(event) => !event.event_params.plugin_id.is_empty(),
             _ => false,
         }
     }
@@ -176,7 +181,9 @@ pub(crate) struct CodexAcceptedLineFingerprintsEventParams {
     pub(crate) repo_hash: Option<String>,
     pub(crate) accepted_added_lines: u64,
     pub(crate) accepted_deleted_lines: u64,
-    pub(crate) line_fingerprints: Vec<AcceptedLineFingerprint>,
+    // Analytics ingestion and warehouse schemas require this field on the wire.
+    // Keep it statically empty; line fingerprints are no longer generated.
+    pub(crate) line_fingerprints: [(); 0],
 }
 
 #[derive(Serialize)]
@@ -751,6 +758,25 @@ pub(crate) struct CodexCommandExecutionEventRequest {
 }
 
 #[derive(Serialize)]
+pub(crate) struct CodexPluginMeasurementEventParams {
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) item_id: String,
+    pub(crate) plugin_id: String,
+    pub(crate) execution_id: String,
+    pub(crate) operation: String,
+    pub(crate) measurement_name: String,
+    pub(crate) number_value: f64,
+    pub(crate) dimensions: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexPluginMeasurementEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexPluginMeasurementEventParams,
+}
+
+#[derive(Serialize)]
 pub(crate) struct CodexFileChangeEventParams {
     #[serde(flatten)]
     pub(crate) base: CodexToolItemEventBase,
@@ -800,6 +826,19 @@ pub(crate) struct CodexDynamicToolCallEventParams {
 pub(crate) struct CodexDynamicToolCallEventRequest {
     pub(crate) event_type: &'static str,
     pub(crate) event_params: CodexDynamicToolCallEventParams,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexControlToolCallEventParams {
+    #[serde(flatten)]
+    pub(crate) base: CodexToolItemEventBase,
+    pub(crate) success: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexControlToolCallEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexControlToolCallEventParams,
 }
 
 #[derive(Serialize)]
@@ -882,6 +921,8 @@ pub(crate) struct CodexHookRunMetadata {
     pub(crate) model_slug: Option<String>,
     pub(crate) hook_name: Option<String>,
     pub(crate) hook_source: Option<&'static str>,
+    pub(crate) handler_type: Option<HookHandlerType>,
+    pub(crate) execution_mode: Option<HookExecutionMode>,
     pub(crate) status: Option<HookRunStatus>,
 }
 
@@ -1336,6 +1377,8 @@ pub(crate) fn codex_hook_run_metadata(
         model_slug: Some(tracking.model_slug.clone()),
         hook_name: Some(analytics_hook_event_name(hook.event_name).to_owned()),
         hook_source: Some(analytics_hook_source(hook.hook_source)),
+        handler_type: Some(hook.handler_type),
+        execution_mode: Some(hook.execution_mode),
         status: Some(analytics_hook_status(hook.status)),
     }
 }

@@ -40,6 +40,7 @@ static PENDING_FORWARDED_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 const FORWARDED_SIGNALS: &[libc::c_int] =
     &[libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const SYNTHETIC_MOUNT_MARKER_SYNTHETIC: &[u8] = b"synthetic\n";
 const SYNTHETIC_MOUNT_MARKER_EXISTING: &[u8] = b"existing\n";
 const PROTECTED_CREATE_MARKER: &[u8] = b"protected-create\n";
@@ -130,6 +131,10 @@ pub struct LandlockCommand {
     #[arg(long = "proxy-route-spec", hide = true)]
     pub proxy_route_spec: Option<String>,
 
+    /// Inherited fallback mounts that must be authenticated before sandboxed code runs.
+    #[arg(long = "verify-fd-mount", hide = true)]
+    pub verify_fd_mounts: Vec<String>,
+
     /// When set, skip mounting a fresh `/proc` even though PID isolation is
     /// still enabled. This is primarily intended for restrictive container
     /// environments that deny `--proc /proc`.
@@ -157,12 +162,16 @@ pub fn run_main() -> ! {
         apply_seccomp_then_exec,
         allow_network_for_proxy,
         proxy_route_spec,
+        verify_fd_mounts,
         no_proc,
         command,
     } = LandlockCommand::parse();
 
     if command.is_empty() {
         panic!("No command specified to execute.");
+    }
+    if !apply_seccomp_then_exec && !verify_fd_mounts.is_empty() {
+        panic!("--verify-fd-mount is only supported in the inner sandbox stage");
     }
     ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec, use_legacy_landlock);
     let EffectivePermissions {
@@ -180,6 +189,34 @@ pub fn run_main() -> ! {
     // Inner stage: apply seccomp/no_new_privs after bubblewrap has already
     // established the filesystem view.
     if apply_seccomp_then_exec {
+        if let Err(err) = crate::fd_mount::verify_fd_mounts(&verify_fd_mounts) {
+            panic!("failed to verify descriptor-backed bubblewrap mount: {err}");
+        }
+
+        let mut capability_header = [LINUX_CAPABILITY_VERSION_3, 0];
+        let mut capability_sets = [[0_u32; 3]; 2];
+        // SAFETY: capability ABI version 3 uses a [version, pid] header and
+        // two [effective, permitted, inheritable] capability-set entries.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_capget,
+                capability_header.as_mut_ptr(),
+                capability_sets.as_mut_ptr(),
+            )
+        };
+        if result < 0 {
+            panic!(
+                "failed to verify Linux sandbox capabilities: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if capability_sets
+            .into_iter()
+            .any(|[effective, permitted, _]| effective != 0 || permitted != 0)
+        {
+            panic!("Linux sandbox retained effective or permitted capabilities");
+        }
+
         if allow_network_for_proxy {
             let spec = proxy_route_spec
                 .as_deref()
@@ -198,7 +235,40 @@ pub fn run_main() -> ! {
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
-        exec_or_panic(command);
+
+        let signal_mask = ForwardedSignalMask::block();
+        let command_pid = unsafe { libc::fork() };
+        if command_pid < 0 {
+            let err = std::io::Error::last_os_error();
+            panic!("failed to fork sandboxed command: {err}");
+        }
+
+        if command_pid == 0 {
+            reset_forwarded_signal_handlers_to_default();
+            signal_mask.restore();
+            exec_or_panic(command);
+        }
+
+        let signal_forwarders = install_bwrap_signal_forwarders(command_pid);
+        signal_mask.restore();
+        loop {
+            let mut status = 0;
+            let reaped_pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+            if reaped_pid == command_pid {
+                let exit_signal_mask = ForwardedSignalMask::block();
+                signal_forwarders.restore();
+                exit_signal_mask.restore();
+                exit_with_wait_status(status);
+            }
+            if reaped_pid >= 0 {
+                continue;
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                panic!("failed to reap sandboxed child: {err}");
+            }
+        }
     }
 
     if file_system_sandbox_policy.has_full_disk_write_access() && !allow_network_for_proxy {

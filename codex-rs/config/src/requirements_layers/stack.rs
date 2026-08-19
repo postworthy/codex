@@ -63,8 +63,8 @@ pub fn compose_requirements(
     compose_requirements_with_hostname_resolver(layers, crate::host_name)
 }
 
-#[cfg(test)]
-pub(super) fn compose_requirements_for_hostname(
+/// Composes requirements using an explicitly supplied execution-host hostname.
+pub fn compose_requirements_for_hostname(
     layers: impl IntoIterator<Item = RequirementsLayerEntry>,
     hostname: Option<&str>,
 ) -> Result<Option<ConfigRequirementsWithSources>, RequirementsCompositionError> {
@@ -213,6 +213,8 @@ fn populate_merged_regular_fields_with_sources(
     let ConfigRequirementsToml {
         allowed_login_methods,
         allowed_chatgpt_workspaces,
+        cli_auth_credentials_store,
+        chatgpt_base_url,
         sqlite_home,
         log_dir,
         model_catalog_json,
@@ -249,6 +251,8 @@ fn populate_merged_regular_fields_with_sources(
 
     set_sourced!(allowed_login_methods, &["allowed_login_methods"]);
     set_sourced!(allowed_chatgpt_workspaces, &["allowed_chatgpt_workspaces"]);
+    set_sourced!(cli_auth_credentials_store, &["cli_auth_credentials_store"]);
+    set_sourced!(chatgpt_base_url, &["chatgpt_base_url"]);
     set_sourced!(sqlite_home, &["sqlite_home"]);
     set_sourced!(log_dir, &["log_dir"]);
     set_sourced!(model_catalog_json, &["model_catalog_json"]);

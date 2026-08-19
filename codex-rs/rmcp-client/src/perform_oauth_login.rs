@@ -446,6 +446,8 @@ fn resolve_redirect_uri(server: &Server, callback_url: Option<&str>) -> Result<S
 }
 
 fn callback_id_from_server_url(server_url: &str) -> Result<String> {
+    // Native Codex callback IDs intentionally hash the complete MCP URL (minus its fragment)
+    // with SHA-256. Python connector callback IDs use SHAKE-256 over the origin and are distinct.
     let mut parsed =
         Url::parse(server_url).with_context(|| format!("invalid MCP server URL `{server_url}`"))?;
     parsed
@@ -546,9 +548,10 @@ impl OauthLoginFlow {
         let oauth_http_client = Arc::new(OAuthHttpClientAdapter::new_with_redirect_mode(
             http_client,
             default_headers,
+            server_url,
             has_configured_headers,
             redirect_mode,
-        ));
+        )?);
 
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
         let oauth_state = if let Some(oauth_client_id) =
@@ -568,6 +571,7 @@ impl OauthLoginFlow {
                 oauth_http_client,
                 &scope_refs,
                 &redirect_uri,
+                &callback_id,
                 client_registration,
             )
             .await?
@@ -698,7 +702,6 @@ async fn start_authorization(
     let mut auth_manager =
         AuthorizationManager::new_with_oauth_http_client(server_url, http_client).await?;
     auth_manager.set_allow_missing_issuer(true);
-
     let metadata = auth_manager.resolve_metadata().await?.metadata;
     auth_manager.set_metadata(metadata);
     auth_manager.configure_client(
@@ -865,6 +868,7 @@ mod tests {
                         OutboundProxyPolicy::ReqwestDefault,
                     ))),
                     HeaderMap::new(),
+                    &format!("{base_url}/mcp"),
                 )),
                 scopes,
                 redirect_uri,
@@ -895,7 +899,6 @@ mod tests {
             assert_eq!(registration_requests.load(Ordering::SeqCst), 0);
         }
     }
-
     #[tokio::test]
     async fn oauth_callback_validates_rfc_9207_issuer_before_token_exchange() {
         for (supports_issuer, callback_issuer, expected_token_requests) in [
@@ -959,6 +962,7 @@ mod tests {
                         OutboundProxyPolicy::ReqwestDefault,
                     ))),
                     HeaderMap::new(),
+                    &format!("{issuer}/mcp"),
                 )),
                 &[],
                 "http://127.0.0.1/callback",
@@ -1132,12 +1136,7 @@ mod tests {
         assert_ne!(callback_id, different_path);
         assert_ne!(callback_id, different_query);
         assert_ne!(callback_id, different_origin);
-        assert_eq!(callback_id.len(), 12);
-        assert!(
-            callback_id
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-        );
+        assert_eq!(callback_id, "XuuuHAzzHOni");
     }
 
     #[test]

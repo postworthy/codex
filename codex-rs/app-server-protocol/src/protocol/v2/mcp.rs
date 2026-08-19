@@ -85,8 +85,13 @@ pub struct ListMcpServerStatusResponse {
 pub struct McpResourceReadParams {
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
+    /// Originating MCP tool call used to select the resource's app.
+    #[ts(optional = nullable)]
+    pub origin_call_id: Option<String>,
     pub server: String,
     pub uri: String,
+    #[ts(optional = nullable)]
+    pub connector_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -94,6 +99,8 @@ pub struct McpResourceReadParams {
 #[ts(export_to = "v2/")]
 pub struct McpResourceReadResponse {
     pub contents: Vec<McpResourceContent>,
+    /// Originating call when the server applied app-specific resource scoping.
+    pub origin_call_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -196,7 +203,7 @@ pub struct McpServerOauthLoginParams {
     pub name: String,
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
-    /// Registration strategy for this login only; omission preserves automatic DCR.
+    /// Registration strategy for this login only; omission selects automatic discovery.
     #[ts(optional = nullable)]
     pub client_registration: Option<McpServerOauthClientRegistration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,6 +220,7 @@ pub struct McpServerOauthLoginParams {
 pub enum McpServerOauthClientRegistration {
     #[default]
     Auto,
+    Cimd,
     Dcr,
 }
 

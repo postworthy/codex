@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::sandboxing::SandboxPermissions;
@@ -90,9 +91,9 @@ fn configure_saved_prefix_and_guardian(config: &mut Config) {
 }
 
 fn command_response(response_id: &str, call_id: &str, command_tool: CommandTool) -> Result<String> {
-    let (tool_name, command_key, timeout_key) = match command_tool {
-        CommandTool::ShellCommand => ("shell_command", "command", "timeout_ms"),
-        CommandTool::UnifiedExec => ("exec_command", "cmd", "yield_time_ms"),
+    let (tool_name, command_key) = match command_tool {
+        CommandTool::ShellCommand => ("shell_command", "command"),
+        CommandTool::UnifiedExec => ("exec_command", "cmd"),
     };
     let mut args = json!({
         "sandbox_permissions": SandboxPermissions::RequireEscalated,
@@ -100,8 +101,6 @@ fn command_response(response_id: &str, call_id: &str, command_tool: CommandTool)
         "prefix_rule": ["git", "version"],
     });
     args[command_key] = json!(TEST_COMMAND);
-    args[timeout_key] = json!(1_000);
-
     Ok(sse(vec![
         ev_response_created(response_id),
         ev_function_call(call_id, tool_name, &serde_json::to_string(&args)?),
@@ -260,20 +259,17 @@ async fn cyber_model_user_approval_never_offers_a_reusable_prefix(
     .await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run a command with one-time approval".to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 approval_policy: Some(AskForApproval::OnRequest),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let EventMsg::ExecApprovalRequest(approval) = wait_for_event(&test.codex, |event| {

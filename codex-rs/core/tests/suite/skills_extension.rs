@@ -7,8 +7,10 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
@@ -17,7 +19,6 @@ use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_skills_extension::HostSkillProvider;
 use codex_skills_extension::OrchestratorSkillProvider;
@@ -51,6 +52,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_remote;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_mcp_server;
@@ -256,6 +258,7 @@ fn catalog_extensions(
     install_with_providers(&mut extensions, providers, |config: &Config| {
         SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
@@ -447,16 +450,10 @@ async fn rendered_catalogs_for_turns(
     let mut client_warning_messages = Vec::new();
     for _ in 0..turn_count {
         test.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: "Inspect the available skills.".to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Inspect the available skills.".to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
         loop {
             match core_test_support::wait_for_event(&test.codex, |_| true).await {
@@ -538,6 +535,7 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
@@ -584,30 +582,24 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
         .to_path_buf();
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![
-                UserInput::Text {
-                    text: "use all skills".to_string(),
-                    text_elements: Vec::new(),
-                },
-                UserInput::Skill {
-                    name: "host-search".to_string(),
-                    path: host_skill_path.clone(),
-                },
-                UserInput::Skill {
-                    name: "repo-search".to_string(),
-                    path: repo_skill_path.clone(),
-                },
-                UserInput::Skill {
-                    name: "sample:sample-search".to_string(),
-                    path: plugin_skill_path.clone(),
-                },
-            ],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Text {
+                text: "use all skills".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Skill {
+                name: "host-search".to_string(),
+                path: host_skill_path.clone(),
+            },
+            UserInput::Skill {
+                name: "repo-search".to_string(),
+                path: repo_skill_path.clone(),
+            },
+            UserInput::Skill {
+                name: "sample:sample-search".to_string(),
+                path: plugin_skill_path.clone(),
+            },
+        ]))
         .await?;
 
     core_test_support::wait_for_event(&test.codex, |event| {
@@ -715,16 +707,10 @@ async fn agent_plugin_skill_prompt_stays_bounded_without_skills_extension() -> R
     let test = builder.build_with_auto_env(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Skill {
-                name: "acme.tools:review".into(),
-                path: skill_path,
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Skill {
+            name: "acme.tools:review".into(),
+            path: skill_path,
+        }]))
         .await?;
     let warning = core_test_support::wait_for_event(&test.codex, |event| {
         matches!(
@@ -789,22 +775,16 @@ async fn explicit_skill_prompt_precedes_plugin_instructions() -> Result<()> {
     let test = builder.build_with_auto_env(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![
-                UserInput::Skill {
-                    name: "sample:sample-search".to_string(),
-                    path: skill_path,
-                },
-                UserInput::Mention {
-                    name: "sample".to_string(),
-                    path: "plugin://sample@test".to_string(),
-                },
-            ],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Skill {
+                name: "sample:sample-search".to_string(),
+                path: skill_path,
+            },
+            UserInput::Mention {
+                name: "sample".to_string(),
+                path: "plugin://sample@test".to_string(),
+            },
+        ]))
         .await?;
     core_test_support::wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -982,6 +962,7 @@ async fn explicit_only_orchestrator_skill_is_hidden_but_can_be_invoked() -> Resu
             .with_orchestrator_provider(Arc::new(OrchestratorSkillProvider::new())),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: true,
             shadow_selection_enabled: false,
@@ -1142,6 +1123,7 @@ async fn production_turn_aliases_discovered_singleton_orchestrator_root() -> Res
             .with_orchestrator_provider(Arc::new(OrchestratorSkillProvider::new())),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: true,
             shadow_selection_enabled: false,
@@ -1179,8 +1161,8 @@ async fn production_turn_aliases_discovered_singleton_orchestrator_root() -> Res
         "model request should include the aliased orchestrator skill: {developer_text}"
     );
     assert!(
-        developer_text.contains("- Root aliases: Expand short locators"),
-        "model request should explain how to expand resource aliases: {developer_text}"
+        developer_text.contains("- Root aliases: Pass short package locators directly"),
+        "model request should explain how to read aliased packages: {developer_text}"
     );
 
     Ok(())
@@ -1236,23 +1218,130 @@ async fn production_turn_aliases_executor_skill_roots() -> Result<()> {
         "model request should include the executor skill root: {developer_text}"
     );
     assert!(
-        developer_text.contains("environment resource: e0/search/SKILL.md"),
+        developer_text.contains("executor package: e0/search"),
         "model request should include the aliased executor skill: {developer_text}"
     );
     let executor_catalog = developer_text
         .split("<skills_instructions>")
         .filter_map(|fragment| fragment.split_once("</skills_instructions>"))
         .map(|(fragment, _)| fragment)
-        .find(|fragment| fragment.contains("environment resource: e0/search/SKILL.md"))
+        .find(|fragment| fragment.contains("executor package: e0/search"))
         .expect("model request should include an executor skills catalog");
+    assert!(
+        executor_catalog.contains("Read a skill package directly with `skills.read"),
+        "Sol should receive direct-read instructions for executor skills: {executor_catalog}"
+    );
     assert!(
         !executor_catalog.contains("### How to use skills"),
         "Sol should omit optional skill usage instructions: {executor_catalog}"
     );
     assert!(
-        !executor_catalog.contains("- Root aliases: Expand short locators"),
+        !executor_catalog.contains("- Root aliases: Pass short package locators directly"),
         "Sol should not include optional resource-alias instructions: {executor_catalog}"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_skill_invocation_is_environment_scoped_and_deduplicated() -> Result<()> {
+    skip_if_remote!(Ok(()), "executor fixture uses a host-local skill path");
+    skip_if_no_network!(Ok(()));
+
+    const SELECTED_RESOURCE: &str = "skill://selected-root/demo/SKILL.md";
+
+    let server = responses::start_mock_server().await;
+    let codex_home = Arc::new(TempDir::new()?);
+    let skill_path = codex_home.path().join("executor-skill/SKILL.md");
+    std::fs::create_dir_all(
+        skill_path
+            .parent()
+            .expect("skill path should have a parent"),
+    )?;
+    std::fs::write(&skill_path, "executor skill contents\n")?;
+    let skill_uri = PathUri::from_host_native_path(&skill_path)?;
+    let catalog = SkillCatalog {
+        entries: vec![
+            SkillCatalogEntry::new(
+                SkillPackageId("skill://other-root/demo".to_string()),
+                SkillAuthority::new(SkillSourceKind::Executor, "other-root"),
+                "other-environment-skill",
+                "Skill from another environment.",
+                SkillResourceId::environment(
+                    "skill://other-root/demo/SKILL.md",
+                    "other-environment",
+                    skill_uri.clone(),
+                ),
+            ),
+            SkillCatalogEntry::new(
+                SkillPackageId("skill://selected-root/demo".to_string()),
+                SkillAuthority::new(SkillSourceKind::Executor, "selected-root"),
+                "selected-environment-skill",
+                "Skill from the selected environment.",
+                SkillResourceId::environment(SELECTED_RESOURCE, LOCAL_ENVIRONMENT_ID, skill_uri),
+            ),
+        ],
+        warnings: Vec::new(),
+    };
+    let read_command = if cfg!(windows) {
+        format!("Get-Content -LiteralPath \"{}\"", skill_path.display())
+    } else {
+        format!("cat {}", skill_path.display())
+    };
+    let command = json!({
+        "cmd": read_command,
+        "login": false,
+    })
+    .to_string();
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                responses::ev_function_call("executor-skill-first", "exec_command", &command),
+                responses::ev_function_call("executor-skill-again", "exec_command", &command),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        ],
+    )
+    .await;
+
+    let (extensions, _) = catalog_extensions(catalog, /*include_host_provider*/ false);
+    let chatgpt_base_url = server.uri();
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_extensions(extensions)
+        .with_config(move |config| {
+            configure_catalog_test(config);
+            config.chatgpt_base_url = chatgpt_base_url;
+            config.use_experimental_unified_exec_tool = true;
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("unified exec should be configurable in tests");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    test.submit_turn("Read the executor skill twice.").await?;
+
+    for call_id in ["executor-skill-first", "executor-skill-again"] {
+        let output = response
+            .function_call_output_text(call_id)
+            .expect("executor skill command should return output");
+        assert!(
+            output.contains("executor skill contents"),
+            "command output: {output}"
+        );
+    }
+
+    let events = wait_for_analytics_events(&server, "skill_invocation", /*expected_count*/ 1).await;
+    assert_eq!(events.len(), 1, "executor skill should be counted once");
+    assert_eq!(events[0]["skill_name"], "selected-environment-skill");
+    assert_eq!(
+        events[0]["skill_id"],
+        format!("{:x}", sha1::Sha1::digest(SELECTED_RESOURCE.as_bytes()))
+    );
+    assert_eq!(events[0]["event_params"]["invoke_type"], "implicit");
 
     Ok(())
 }
@@ -1327,6 +1416,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
             .with_host_provider(Arc::new(HostSkillProvider::new())),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: true,
             shadow_selection_enabled: false,
@@ -1366,7 +1456,7 @@ async fn production_turn_aliases_combined_skill_catalogs_under_shared_budget() -
         );
     }
     for (source, alias, prefix, suffix) in [
-        ("environment resource", "e0", "executor", "/SKILL.md"),
+        ("executor package", "e0", "executor", ""),
         ("orchestrator package", "o0", "orchestrator", ""),
         ("file", "r0", "host", "/SKILL.md"),
     ] {
@@ -1427,6 +1517,7 @@ async fn production_turn_scales_extension_catalog_from_resolved_model_window() -
             )),
             |config: &Config| SkillsExtensionConfig {
                 include_instructions: config.include_skill_instructions,
+                max_context_tokens: config.skill_max_context_tokens,
                 bundled_skills_enabled: false,
                 orchestrator_skills_enabled: false,
                 shadow_selection_enabled: false,
@@ -1530,6 +1621,52 @@ async fn production_turn_shares_catalog_budget_across_host_and_executor_sections
     assert_shortened_descriptions(&host_lines, &HOST_CATALOG);
     assert_shortened_descriptions(&executor_lines, &EXECUTOR_CATALOG);
     assert!(metadata_cost(&combined_lines) <= 240);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_turn_uses_configured_skill_catalog_token_budget() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new()?);
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[skills]\nmax_context_tokens = 800\n",
+    )?;
+    write_host_skills(codex_home.path(), &HOST_CATALOG)?;
+    let (extensions, _event_rx) = catalog_extensions(
+        executor_catalog(&EXECUTOR_CATALOG),
+        /*include_host_provider*/ true,
+    );
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_extensions(extensions)
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info.context_window = Some(SHORTENING_CONTEXT_WINDOW);
+            model_info.max_context_window = None;
+        })
+        .with_config(configure_catalog_test);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    test.submit_turn("Inspect the available skills.").await?;
+    let request = response.single_request();
+    let developer_texts = request.message_input_texts("developer");
+    let host_lines = skill_lines(catalog_text(&developer_texts, "host"), "host");
+    let executor_lines = skill_lines(catalog_text(&developer_texts, "exec"), "exec");
+    let combined_lines = host_lines
+        .iter()
+        .chain(executor_lines.iter())
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert_full_descriptions(&host_lines, &HOST_CATALOG);
+    assert_full_descriptions(&executor_lines, &EXECUTOR_CATALOG);
+    assert!(metadata_cost(&combined_lines) <= 800);
 
     Ok(())
 }
@@ -1700,6 +1837,7 @@ async fn production_turn_uses_provider_host_catalog_and_core_snapshot_injection(
         })),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
@@ -1800,6 +1938,7 @@ async fn production_turn_suppresses_only_the_superseded_host_skill_prompt() -> R
         )),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,
@@ -1866,22 +2005,16 @@ async fn production_turn_warns_and_omits_unreadable_host_skill() -> Result<()> {
 
     std::fs::remove_file(&missing_skill_path)?;
     test.codex
-        .submit(Op::UserInput {
-            items: vec![
-                UserInput::Skill {
-                    name: "missing-host".to_string(),
-                    path: missing_skill_path.clone(),
-                },
-                UserInput::Skill {
-                    name: "available-host".to_string(),
-                    path: available_skill_path.clone(),
-                },
-            ],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Skill {
+                name: "missing-host".to_string(),
+                path: missing_skill_path.clone(),
+            },
+            UserInput::Skill {
+                name: "available-host".to_string(),
+                path: available_skill_path.clone(),
+            },
+        ]))
         .await?;
 
     let mut warnings = Vec::new();
@@ -2054,6 +2187,7 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
             .with_orchestrator_provider(Arc::new(CatalogSkillProvider { catalog })),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: config.orchestrator_skills_enabled,
             shadow_selection_enabled: false,
@@ -2080,16 +2214,10 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
     ] {
         orchestrator_thread
             .thread
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: prompt.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: prompt.to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
         core_test_support::wait_for_event(&orchestrator_thread.thread, |event| {
             matches!(event, EventMsg::TurnComplete(_))
@@ -2112,9 +2240,11 @@ async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns
             occurrences, 1,
             "request {index} should contain the orchestrator catalog exactly once: {developer_texts:?}"
         );
-        assert!(developer_texts.iter().any(|text| {
-            text.contains("Read an orchestrator package directly with `skills.read")
-        }));
+        assert!(
+            developer_texts
+                .iter()
+                .any(|text| text.contains("Read a skill package directly with `skills.read"))
+        );
     }
 
     Ok(())
@@ -2263,7 +2393,10 @@ async fn production_turn_omits_host_skills_before_executor_skills_under_extreme_
     let host_lines = skill_lines(catalog_text(&developer_texts, "host"), "host");
     let executor_lines = skill_lines(catalog_text(&developer_texts, "exec"), "exec");
 
-    assert_eq!(skill_names(&host_lines), vec!["host-beta"]);
+    assert_eq!(
+        skill_names(&host_lines),
+        vec!["host-alpha", "host-beta", "host-delta"]
+    );
     assert_eq!(
         skill_names(&executor_lines),
         EXECUTOR_CATALOG
@@ -2272,7 +2405,7 @@ async fn production_turn_omits_host_skills_before_executor_skills_under_extreme_
             .collect::<Vec<_>>()
     );
     assert!(warning_messages.contains(
-        &"Exceeded skills context budget. All skill descriptions were removed and 3 additional skills were not included in the model-visible skills list."
+        &"Exceeded skills context budget. All skill descriptions were removed and 1 additional skill was not included in the model-visible skills list."
             .to_string()
     ));
 
@@ -2320,6 +2453,7 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
         )),
         |config: &Config| SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
             orchestrator_skills_enabled: false,
             shadow_selection_enabled: false,

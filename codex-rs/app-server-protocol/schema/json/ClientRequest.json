@@ -1503,6 +1503,18 @@
       },
       "type": "object"
     },
+    "GetAccountTokenUsageParams": {
+      "properties": {
+        "threadId": {
+          "description": "When present, read estimated usage for this thread instead of account-wide token activity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "HookMigration": {
       "properties": {
         "name": {
@@ -1900,6 +1912,19 @@
     },
     "McpResourceReadParams": {
       "properties": {
+        "connectorId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "originCallId": {
+          "description": "Originating MCP tool call used to select the resource's app.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "server": {
           "type": "string"
         },
@@ -1933,6 +1958,7 @@
     "McpServerOauthClientRegistration": {
       "enum": [
         "auto",
+        "cimd",
         "dcr"
       ],
       "type": "string"
@@ -1948,7 +1974,7 @@
               "type": "null"
             }
           ],
-          "description": "Registration strategy for this login only; omission preserves automatic DCR."
+          "description": "Registration strategy for this login only; omission selects automatic discovery."
         },
         "name": {
           "type": "string"
@@ -2535,6 +2561,17 @@
       "required": [
         "cols",
         "rows"
+      ],
+      "type": "object"
+    },
+    "ProjectRoot": {
+      "properties": {
+        "path": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "required": [
+        "path"
       ],
       "type": "object"
     },
@@ -7261,7 +7298,14 @@
           "type": "string"
         },
         "params": {
-          "type": "null"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GetAccountTokenUsageParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

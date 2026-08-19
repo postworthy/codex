@@ -191,16 +191,15 @@ impl ExecCommandHandler {
         let sandbox_permissions =
             resolve_sandbox_permissions(args.sandbox_permissions, args.justification.as_deref())?;
         let hook_command = args.cmd.clone();
-        // TODO(anp) wire PathUri through implicit skills instead of skipping on foreign paths
-        if let Some(native_cwd) = native_cwd.as_ref() {
-            maybe_emit_implicit_skill_invocation(
-                session.as_ref(),
-                context.step_context.turn.as_ref(),
-                &hook_command,
-                native_cwd,
-            )
-            .await;
-        }
+        maybe_emit_implicit_skill_invocation(
+            session.as_ref(),
+            context.step_context.turn.as_ref(),
+            &hook_command,
+            &cwd,
+            native_cwd.as_ref(),
+            &turn_environment.selection.environment_id,
+        )
+        .await;
         let shell_mode =
             shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
         // Remote environments may use a different OS and must build commands with their native
@@ -218,13 +217,13 @@ impl ExecCommandHandler {
             let Some(remote_shell) = turn_environment.shell.as_ref() else {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "environment `{}` does not report a shell",
-                    turn_environment.environment_id
+                    turn_environment.selection.environment_id
                 )));
             };
             if detect_shell_type(Path::new(&requested_shell)) != Some(remote_shell.shell_type) {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "environment `{}` only supports `{}`",
-                    turn_environment.environment_id,
+                    turn_environment.selection.environment_id,
                     remote_shell.name()
                 )));
             }
@@ -234,7 +233,7 @@ impl ExecCommandHandler {
             &args,
             shell,
             &shell_mode,
-            turn_environment.config.allow_login_shell,
+            turn_environment.config().allow_login_shell,
         )
         .map_err(FunctionCallError::RespondToModel)?;
         let command = resolved_command.command;
@@ -259,7 +258,7 @@ impl ExecCommandHandler {
         let permission_cwd = native_cwd.as_ref().unwrap_or(&turn.config.cwd);
         let effective_additional_permissions = apply_granted_turn_permissions(
             context.session.as_ref(),
-            &turn_environment.environment_id,
+            &turn_environment.selection.environment_id,
             permission_cwd.as_path(),
             sandbox_permissions,
             additional_permissions,
