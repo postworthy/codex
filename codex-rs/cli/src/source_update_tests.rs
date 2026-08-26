@@ -52,9 +52,20 @@ fn source_package_build_uses_supported_packaging_path() {
         Some(bwrap),
     );
     let args: Vec<OsString> = command.get_args().map(OsString::from).collect();
+    let envs: Vec<(OsString, Option<OsString>)> = command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+        .collect();
 
     assert_eq!(command.get_program(), "python3");
     assert_eq!(command.get_current_dir(), Some(build_dir));
+    assert_eq!(
+        envs,
+        vec![(
+            OsString::from("CODEX_REPO_ROOT"),
+            Some(build_dir.as_os_str().to_os_string()),
+        )]
+    );
     assert_eq!(
         args,
         vec![

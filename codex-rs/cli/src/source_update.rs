@@ -96,6 +96,7 @@ fn source_package_build_command(
         .arg("--package-dir")
         .arg(package_dir)
         .arg("--force")
+        .env("CODEX_REPO_ROOT", build_dir)
         .current_dir(build_dir);
     if let Some(system_bwrap) = system_bwrap {
         command.arg("--bwrap-bin").arg(system_bwrap);
