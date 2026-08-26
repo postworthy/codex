@@ -44,6 +44,17 @@ fn parse_listen_url_accepts_stdio_transports() {
 }
 
 #[test]
+fn parse_listen_url_accepts_legacy_source_update_probe() {
+    let address = "127.0.0.1:0"
+        .parse()
+        .expect("legacy source-update probe should have a valid address");
+    assert_eq!(
+        parse_listen_url("ws://127.0.0.1:0").expect("legacy source-update probe URL should parse"),
+        ListenTransport::LegacySourceUpdateProbe(address)
+    );
+}
+
+#[test]
 fn parse_listen_url_rejects_invalid_transports() {
     let invalid_address = parse_listen_url("grpc://localhost:9000")
         .expect_err("gRPC listener requires an IP address");

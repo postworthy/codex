@@ -142,10 +142,11 @@ exec python3 -c 'import socket
 s = socket.socket()
 s.bind(("127.0.0.1", 0))
 s.listen(1)
-print("ws://%s:%d" % s.getsockname(), flush=True)
+print("http://%s:%d" % s.getsockname(), flush=True)
 c, _ = s.accept()
-c.recv(4096)
-c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+request = c.recv(4096)
+status = b"200 OK" if request.startswith(b"GET /healthz ") else b"404 Not Found"
+c.sendall(b"HTTP/1.1 " + status + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 c.close()
 s.close()'
 "#,

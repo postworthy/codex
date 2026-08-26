@@ -12,12 +12,16 @@ pub const DEFAULT_LISTEN_URL: &str = "stdio";
 enum ListenTransport {
     Stdio,
     Grpc(SocketAddr),
+    LegacySourceUpdateProbe(SocketAddr),
 }
 
 pub(crate) async fn run_transport(listen_url: &str) -> Result<()> {
     match parse_listen_url(listen_url)? {
         ListenTransport::Stdio => crate::run_stdio().await,
         ListenTransport::Grpc(bind_address) => grpc_transport::run_tcp_listener(bind_address).await,
+        ListenTransport::LegacySourceUpdateProbe(bind_address) => {
+            grpc_transport::run_legacy_source_update_probe(bind_address).await
+        }
     }
 }
 
@@ -33,6 +37,15 @@ fn parse_listen_url(listen_url: &str) -> Result<ListenTransport> {
             .with_context(|| {
                 format!("invalid gRPC --listen URL `{listen_url}`; expected `grpc://IP:PORT`")
             });
+    }
+
+    // Source updater builds released before the gRPC migration probe the
+    // packaged host through this exact legacy URL. Keep only its readiness
+    // contract so those installed binaries can bootstrap to a current build.
+    if listen_url == "ws://127.0.0.1:0" {
+        return Ok(ListenTransport::LegacySourceUpdateProbe(SocketAddr::from(
+            ([127, 0, 0, 1], 0),
+        )));
     }
 
     anyhow::bail!(

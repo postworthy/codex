@@ -234,7 +234,7 @@ fn smoke_test_package(package_dir: &Path) -> anyhow::Result<()> {
 
 fn smoke_test_code_mode_host(host: &Path) -> anyhow::Result<()> {
     let mut child = Command::new(host)
-        .args(["--listen", "ws://127.0.0.1:0"])
+        .args(["--listen", "grpc://127.0.0.1:0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -260,7 +260,7 @@ fn check_host_readiness(child: &mut Child) -> anyhow::Result<()> {
     let listen_url = receiver
         .recv_timeout(HOST_START_TIMEOUT)
         .context("timed out waiting for code-mode host readiness address")??;
-    let address = listen_url.trim().strip_prefix("ws://").ok_or_else(|| {
+    let address = listen_url.trim().strip_prefix("http://").ok_or_else(|| {
         anyhow::anyhow!("code-mode host returned invalid address: {listen_url:?}")
     })?;
     let mut stream = TcpStream::connect(address).context("connect to code-mode host")?;
@@ -268,7 +268,7 @@ fn check_host_readiness(child: &mut Child) -> anyhow::Result<()> {
     stream.set_write_timeout(Some(HOST_START_TIMEOUT))?;
     write!(
         stream,
-        "GET /readyz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        "GET /healthz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
     )?;
     let mut status_line = String::new();
     BufReader::new(stream).read_line(&mut status_line)?;

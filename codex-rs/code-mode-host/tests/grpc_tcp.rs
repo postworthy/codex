@@ -39,6 +39,16 @@ async fn tcp_listener_serves_http1_healthz() -> Result<()> {
 }
 
 #[tokio::test]
+async fn legacy_source_update_probe_serves_readyz() -> Result<()> {
+    let host = HostHarness::start("ws://127.0.0.1:0").await?;
+    let request = "GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = http1_response_with_scheme(&host.endpoint, "ws", request.as_bytes()).await?;
+
+    assert_eq!(response.lines().next(), Some("HTTP/1.1 200 OK"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn tcp_listener_rejects_http1_grpc_requests() -> Result<()> {
     let host = HostHarness::start("grpc://127.0.0.1:0").await?;
     let mut request = concat!(
@@ -93,9 +103,17 @@ async fn tcp_listener_serves_http2_healthz() -> Result<()> {
 }
 
 async fn http1_response(endpoint: &str, request: &[u8]) -> Result<String> {
+    http1_response_with_scheme(endpoint, "http", request).await
+}
+
+async fn http1_response_with_scheme(
+    endpoint: &str,
+    scheme: &str,
+    request: &[u8],
+) -> Result<String> {
     let address = endpoint
-        .strip_prefix("http://")
-        .context("gRPC code-mode host URL should use http://")?;
+        .strip_prefix(&format!("{scheme}://"))
+        .with_context(|| format!("code-mode host URL should use {scheme}://"))?;
 
     timeout(TEST_TIMEOUT, async {
         let mut stream = TcpStream::connect(address)

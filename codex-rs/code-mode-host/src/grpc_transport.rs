@@ -22,12 +22,24 @@ use tracing::info;
 use crate::GrpcCodeModeHost;
 
 pub(super) async fn run_tcp_listener(bind_address: SocketAddr) -> Result<()> {
+    run_tcp_listener_with_endpoint_scheme(bind_address, "http", "/healthz").await
+}
+
+pub(super) async fn run_legacy_source_update_probe(bind_address: SocketAddr) -> Result<()> {
+    run_tcp_listener_with_endpoint_scheme(bind_address, "ws", "/readyz").await
+}
+
+async fn run_tcp_listener_with_endpoint_scheme(
+    bind_address: SocketAddr,
+    endpoint_scheme: &str,
+    health_path: &'static str,
+) -> Result<()> {
     let listener = bind_tcp_listener(bind_address).await?;
     let local_address = listener
         .local_addr()
         .context("failed to read code-mode gRPC listen address")?;
-    info!("codex-code-mode-host listening on http://{local_address}");
-    println!("http://{local_address}");
+    info!("codex-code-mode-host listening on {endpoint_scheme}://{local_address}");
+    println!("{endpoint_scheme}://{local_address}");
     io::stdout()
         .flush()
         .context("failed to publish code-mode gRPC listen address")?;
@@ -38,11 +50,11 @@ pub(super) async fn run_tcp_listener(bind_address: SocketAddr) -> Result<()> {
             .max_encoding_message_size(MAX_FRAME_BYTES),
     )
     .into_axum_router()
-    .route("/healthz", get(|| async { StatusCode::OK }))
+    .route(health_path, get(|| async { StatusCode::OK }))
     .layer(middleware::from_fn(
-        |request: Request, next: Next| async move {
+        move |request: Request, next: Next| async move {
             if request.version() != Version::HTTP_2
-                && (request.method() != Method::GET || request.uri().path() != "/healthz")
+                && (request.method() != Method::GET || request.uri().path() != health_path)
             {
                 return Err(StatusCode::HTTP_VERSION_NOT_SUPPORTED);
             }
