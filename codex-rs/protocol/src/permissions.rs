@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use globset::GlobBuilder;
 use globset::GlobMatcher;
@@ -238,6 +239,21 @@ pub struct FileSystemSandboxPolicy {
     pub entries: Vec<FileSystemSandboxEntry>,
 }
 
+#[derive(Clone, Copy)]
+enum WritableRootPathResolution {
+    Effective,
+    PreserveMutableComponents,
+}
+
+impl WritableRootPathResolution {
+    fn resolve(self, path: AbsolutePathBuf) -> AbsolutePathBuf {
+        match self {
+            Self::Effective => normalize_effective_absolute_path(path),
+            Self::PreserveMutableComponents => normalize_trusted_top_level_alias(path),
+        }
+    }
+}
+
 /// Serialized filesystem policy used at legacy string-based seams.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[schemars(rename = "FileSystemSandboxPolicy")]
@@ -249,6 +265,17 @@ pub struct RawFileSystemSandboxPolicy {
     pub glob_scan_max_depth: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<RawFileSystemSandboxEntry>,
+}
+
+/// Executor-owned paths needed to interpret filesystem sandbox policy entries.
+///
+/// Orchestrator callers keep these as `PathUri` values until execution crosses
+/// into the executor that owns them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileSystemSandboxPolicyContext<'a> {
+    pub cwd: &'a PathUri,
+    pub workspace_roots: &'a [PathUri],
+    pub temporary_directories: Option<&'a [PathUri]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1004,6 +1031,65 @@ impl FileSystemSandboxPolicy {
         self
     }
 
+    /// Materializes workspace-root entries without projecting executor paths onto the host.
+    pub fn materialize_project_roots_with_path_uris(mut self, workspace_roots: &[PathUri]) -> Self {
+        if let Ok(native_workspace_roots) = workspace_roots
+            .iter()
+            .map(PathUri::to_abs_path)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            return self.materialize_project_roots_with_workspace_roots(&native_workspace_roots);
+        }
+
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for entry in self.entries {
+            let (subpath, is_glob) = match &entry.path {
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots { subpath },
+                } => (subpath.as_deref(), false),
+                FileSystemPath::GlobPattern { pattern }
+                    if pattern.starts_with(PROJECT_ROOTS_GLOB_PATTERN_PREFIX) =>
+                {
+                    (
+                        Some(&pattern[PROJECT_ROOTS_GLOB_PATTERN_PREFIX.len()..]),
+                        true,
+                    )
+                }
+                _ => {
+                    entries.push(entry);
+                    continue;
+                }
+            };
+            entries.extend(workspace_roots.iter().filter_map(|root| {
+                let path = subpath.map_or_else(
+                    || Some(root.clone()),
+                    |subpath| resolve_scoped_workspace_path(root, subpath),
+                );
+                let (path, access) = match path {
+                    Some(path) if is_glob => (
+                        FileSystemPath::GlobPattern {
+                            pattern: path.inferred_native_path_string(),
+                        },
+                        entry.access,
+                    ),
+                    Some(path) => (FileSystemPath::Path { path }, entry.access),
+                    None if !entry.access.can_write() => (
+                        FileSystemPath::Path { path: root.clone() },
+                        FileSystemAccessMode::Deny,
+                    ),
+                    None => return None,
+                };
+                Some(FileSystemSandboxEntry {
+                    path,
+                    access,
+                    missing_path_behavior: entry.missing_path_behavior,
+                })
+            }));
+        }
+        self.entries = entries;
+        self
+    }
+
     /// Preserves symbolic `:workspace_roots` entries while also adding concrete
     /// entries for each provided workspace root.
     pub fn with_materialized_project_roots_for_workspace_roots(
@@ -1149,6 +1235,42 @@ impl FileSystemSandboxPolicy {
     /// Returns the writable roots together with read-only carveouts resolved
     /// against the provided cwd.
     pub fn get_writable_roots_with_cwd(&self, cwd: &Path) -> Vec<WritableRoot> {
+        self.get_writable_roots_with_cwd_impl(cwd, WritableRootPathResolution::Effective)
+    }
+
+    /// Returns whether any effective writable root exists without materializing its carveouts.
+    pub fn has_writable_roots_with_cwd(&self, cwd: &Path) -> bool {
+        !self.has_full_disk_write_access()
+            && self
+                .resolved_entries_with_cwd(cwd)
+                .into_iter()
+                .any(|entry| {
+                    entry.access.can_write()
+                        && self.can_write_path_with_cwd(entry.path.as_path(), cwd)
+                })
+    }
+
+    /// Returns writable roots without following attacker-mutable path components.
+    ///
+    /// Trusted top-level aliases such as `/tmp -> /private/tmp` are still
+    /// normalized so roots and carveouts are compared in the same namespace.
+    /// Deeper components remain exactly as configured until the platform
+    /// sandbox binds them.
+    pub fn get_writable_roots_with_cwd_preserving_mutable_paths(
+        &self,
+        cwd: &Path,
+    ) -> Vec<WritableRoot> {
+        self.get_writable_roots_with_cwd_impl(
+            cwd,
+            WritableRootPathResolution::PreserveMutableComponents,
+        )
+    }
+
+    fn get_writable_roots_with_cwd_impl(
+        &self,
+        cwd: &Path,
+        path_resolution: WritableRootPathResolution,
+    ) -> Vec<WritableRoot> {
         if self.has_full_disk_write_access() {
             return Vec::new();
         }
@@ -1162,8 +1284,12 @@ impl FileSystemSandboxPolicy {
             .collect();
 
         dedup_absolute_paths(
-            writable_entries.clone(),
-            /*normalize_effective_paths*/ true,
+            writable_entries
+                .iter()
+                .cloned()
+                .map(|root| path_resolution.resolve(root))
+                .collect(),
+            /*normalize_effective_paths*/ false,
         )
         .into_iter()
         .map(|root| {
@@ -1177,13 +1303,13 @@ impl FileSystemSandboxPolicy {
             let preserve_raw_carveout_paths = root.as_path().parent().is_some();
             let raw_writable_roots: Vec<&AbsolutePathBuf> = writable_entries
                 .iter()
-                .filter(|path| normalize_effective_absolute_path((*path).clone()) == root)
+                .filter(|path| path_resolution.resolve((*path).clone()) == root)
                 .collect();
             let protected_metadata_names =
                 protected_metadata_names_for_writable_root(self, &root, &raw_writable_roots, cwd);
             let protect_missing_dot_codex = AbsolutePathBuf::from_absolute_path(cwd)
                 .ok()
-                .is_some_and(|cwd| normalize_effective_absolute_path(cwd) == root);
+                .is_some_and(|cwd| path_resolution.resolve(cwd) == root);
             let mut read_only_subpaths: Vec<AbsolutePathBuf> =
                 default_read_only_subpaths_for_writable_root(&root, protect_missing_dot_codex)
                     .into_iter()
@@ -1202,7 +1328,7 @@ impl FileSystemSandboxPolicy {
                     .filter(|entry| !entry.access.can_write())
                     .filter(|entry| !self.can_write_path_with_cwd(entry.path.as_path(), cwd))
                     .filter_map(|entry| {
-                        let effective_path = normalize_effective_absolute_path(entry.path.clone());
+                        let effective_path = path_resolution.resolve(entry.path.clone());
                         // Preserve the literal in-root path whenever the
                         // carveout itself lives under this writable root, even
                         // if following symlinks would resolve back to the root
@@ -1534,6 +1660,28 @@ fn resolve_candidate_path(path: &Path, cwd: &Path) -> Option<AbsolutePathBuf> {
     }
 }
 
+/// Resolves a workspace-relative path using the root's own path convention.
+///
+/// Rejects absolute paths, traversal, Windows drive changes, and any result
+/// outside the root so foreign-platform permission rules cannot escape scope.
+fn resolve_scoped_workspace_path(root: &PathUri, subpath: &str) -> Option<PathUri> {
+    let convention = root.infer_path_convention()?;
+    if subpath.starts_with('/')
+        || convention == PathConvention::Windows && subpath.starts_with('\\')
+        || convention
+            .path_segments(subpath)
+            .any(|segment| segment == "." || segment == "..")
+        || convention == PathConvention::Windows
+            && convention
+                .path_segments(subpath)
+                .any(|segment| segment.contains(':'))
+    {
+        return None;
+    }
+    let path = root.join(subpath).ok()?;
+    path.starts_with(root).then_some(path)
+}
+
 /// Returns true when two config paths refer to the same exact target before
 /// any prefix matching is applied.
 ///
@@ -1752,6 +1900,27 @@ fn normalize_effective_absolute_path(path: AbsolutePathBuf) -> AbsolutePathBuf {
         }
     }
     path
+}
+
+fn normalize_trusted_top_level_alias(path: AbsolutePathBuf) -> AbsolutePathBuf {
+    let Some(top_level) = path.as_path().ancestors().find(|ancestor| {
+        ancestor.parent().is_some() && ancestor.parent().and_then(Path::parent).is_none()
+    }) else {
+        return path;
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(top_level) else {
+        return path;
+    };
+    if !metadata.file_type().is_symlink() {
+        return path;
+    }
+    let Ok(canonical_top_level) = top_level.canonicalize() else {
+        return path;
+    };
+    let Ok(suffix) = path.as_path().strip_prefix(top_level) else {
+        return path;
+    };
+    AbsolutePathBuf::from_absolute_path(canonical_top_level.join(suffix)).unwrap_or(path)
 }
 
 pub(crate) fn default_read_only_subpaths_for_writable_root(
@@ -2109,6 +2278,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn writable_root_presence_matches_materialized_roots() {
+        let cwd = TempDir::new().expect("tempdir");
+        let writable_root = AbsolutePathBuf::resolve_path_against_base("work", cwd.path());
+        let policies = [
+            FileSystemSandboxPolicy::read_only(),
+            FileSystemSandboxPolicy::unrestricted(),
+            FileSystemSandboxPolicy::external_sandbox(),
+            FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
+                writable_root.clone().into(),
+                FileSystemAccessMode::Write,
+            )]),
+            FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry::new(
+                    writable_root.clone().into(),
+                    FileSystemAccessMode::Write,
+                ),
+                FileSystemSandboxEntry::new(writable_root.into(), FileSystemAccessMode::Deny),
+            ]),
+            FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::unknown(
+                        ":future_special_path",
+                        /*subpath*/ None,
+                    ),
+                },
+                FileSystemAccessMode::Write,
+            )]),
+        ];
+
+        for policy in policies {
+            assert_eq!(
+                policy.has_writable_roots_with_cwd(cwd.path()),
+                !policy.get_writable_roots_with_cwd(cwd.path()).is_empty()
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn permission_paths_preserve_native_slash_unc_strings() {
@@ -2294,6 +2501,94 @@ mod tests {
                 .read_only_subpaths
                 .contains(&expected_dot_codex)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preserving_mutable_paths_normalizes_top_level_aliases_consistently() {
+        let root = TempDir::new_in("/tmp").expect("tempdir under /tmp");
+        let logical_root =
+            AbsolutePathBuf::from_absolute_path(root.path()).expect("absolute logical root");
+        let canonical_root = AbsolutePathBuf::from_absolute_path(
+            root.path().canonicalize().expect("canonicalize root"),
+        )
+        .expect("absolute canonical root");
+        let protected = canonical_root.join("protected");
+        fs::create_dir(&protected).expect("create protected path");
+        let policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(logical_root.into(), FileSystemAccessMode::Write),
+            FileSystemSandboxEntry::new(protected.clone().into(), FileSystemAccessMode::Read),
+        ]);
+
+        let roots = policy.get_writable_roots_with_cwd_preserving_mutable_paths(root.path());
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].root, canonical_root);
+        assert!(roots[0].read_only_subpaths.contains(&protected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserving_writable_roots_cannot_be_rebound_during_projection() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::thread;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let active_ancestor = tmp.path().join("active");
+        let parked_ancestor = tmp.path().join("parked");
+        let outside_ancestor = tmp.path().join("outside");
+        let writable_root = active_ancestor.join("workspace");
+        let outside_root = outside_ancestor.join("workspace");
+        fs::create_dir_all(&writable_root).expect("create writable root");
+        fs::create_dir_all(&outside_root).expect("create outside root");
+        let writable_root =
+            AbsolutePathBuf::from_absolute_path(writable_root).expect("absolute writable root");
+        let outside_root =
+            AbsolutePathBuf::from_absolute_path(outside_root).expect("absolute outside root");
+        let expected_writable_root = normalize_trusted_top_level_alias(writable_root.clone());
+        let expected_outside_root = normalize_trusted_top_level_alias(outside_root);
+        let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
+            writable_root.into(),
+            FileSystemAccessMode::Write,
+        )]);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swaps = Arc::new(AtomicUsize::new(0));
+        let racer_stop = Arc::clone(&stop);
+        let racer_swaps = Arc::clone(&swaps);
+        let racer = thread::spawn(move || {
+            while !racer_stop.load(Ordering::Relaxed) {
+                if fs::rename(&active_ancestor, &parked_ancestor).is_err() {
+                    thread::yield_now();
+                    continue;
+                }
+                if symlink_dir(&outside_ancestor, &active_ancestor).is_ok() {
+                    racer_swaps.fetch_add(1, Ordering::Relaxed);
+                    thread::yield_now();
+                    let _ = fs::remove_file(&active_ancestor);
+                }
+                fs::rename(&parked_ancestor, &active_ancestor).expect("restore writable ancestor");
+            }
+        });
+
+        let mut rebound_root = None;
+        for _ in 0..2_000 {
+            let roots = policy.get_writable_roots_with_cwd_preserving_mutable_paths(tmp.path());
+            if roots.len() != 1 || roots[0].root != expected_writable_root {
+                rebound_root = roots.first().map(|root| root.root.clone());
+                break;
+            }
+            assert_ne!(roots[0].root, expected_outside_root);
+            thread::yield_now();
+        }
+        stop.store(true, Ordering::Relaxed);
+        racer.join().expect("join path racer");
+
+        assert!(swaps.load(Ordering::Relaxed) > 0, "racer did not run");
+        assert_eq!(rebound_root, None);
     }
 
     #[test]

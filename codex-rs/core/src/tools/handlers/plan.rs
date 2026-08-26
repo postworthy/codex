@@ -22,7 +22,7 @@ pub struct PlanToolOutput;
 const PLAN_UPDATED_MESSAGE: &str = "Plan updated";
 
 impl ToolOutput for PlanToolOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         PLAN_UPDATED_MESSAGE.to_string()
     }
 
@@ -81,7 +81,7 @@ impl PlanHandler {
             }
         };
 
-        if turn.mode == ModeKind::Plan {
+        if turn.mode() == ModeKind::Plan {
             return Err(FunctionCallError::RespondToModel(
                 "update_plan is a TODO/checklist tool and is not allowed in Plan mode".to_string(),
             ));

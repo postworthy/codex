@@ -8,9 +8,12 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
@@ -1136,12 +1139,6 @@ fn cleanup_protected_create_targets(targets: &[ProtectedCreateTargetRegistration
 
         let mut violation = false;
         for target in targets.iter().rev() {
-            if synthetic_mount_marker_dir_has_active_process(&target.marker_dir) {
-                if target.target.path().exists() {
-                    violation = true;
-                }
-                continue;
-            }
             violation |= remove_protected_create_target(&target.target);
             match fs::remove_dir(&target.marker_dir) {
                 Ok(()) => {}
@@ -1206,7 +1203,13 @@ fn try_remove_protected_create_target(
         ProtectedCreateRemoval::Other
     };
     let result = if removal == ProtectedCreateRemoval::Directory {
-        fs::remove_dir_all(path)
+        match fs::remove_dir_all(path) {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                make_directory_tree_writable(path)?;
+                fs::remove_dir_all(path)
+            }
+            result => result,
+        }
     } else {
         fs::remove_file(path)
     };
@@ -1220,6 +1223,28 @@ fn try_remove_protected_create_target(
         path.display()
     );
     Ok(Some(removal))
+}
+
+fn make_directory_tree_writable(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let directory_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    fs::set_permissions(&directory_path, fs::Permissions::from_mode(0o700))?;
+    for entry in fs::read_dir(directory_path)? {
+        make_directory_tree_writable(&entry?.path())?;
+    }
+    Ok(())
 }
 
 fn remove_synthetic_mount_target(target: &crate::bwrap::SyntheticMountTarget) {
@@ -1308,11 +1333,32 @@ fn synthetic_mount_marker_dir(path: &Path) -> PathBuf {
     synthetic_mount_registry_root().join(format!("{:016x}", hash_path(path)))
 }
 
-fn synthetic_mount_registry_root() -> PathBuf {
-    let effective_uid = unsafe { libc::geteuid() };
-    std::env::temp_dir().join(format!(
-        "codex-bwrap-synthetic-mount-targets-{effective_uid}"
-    ))
+pub(crate) fn synthetic_mount_registry_root() -> PathBuf {
+    static REGISTRY_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+    REGISTRY_ROOT
+        .get_or_init(|| {
+            let effective_uid = unsafe { libc::geteuid() };
+            let temp_dir = std::env::temp_dir();
+            let temp_dir = temp_dir.canonicalize().unwrap_or_else(|err| {
+                panic!(
+                    "failed to resolve synthetic mount registry temp directory {}: {err}",
+                    temp_dir.display()
+                )
+            });
+            let registry_root = temp_dir.join(format!(
+                "codex-bwrap-synthetic-mount-targets-{effective_uid}"
+            ));
+            // A registry symlink can redirect bookkeeping into a writable root
+            // that does not overlap TMPDIR, bypassing its read-only mount.
+            assert!(
+                !registry_root.is_symlink(),
+                "synthetic mount registry must not be a symlink: {}",
+                registry_root.display()
+            );
+            registry_root
+        })
+        .clone()
 }
 
 fn hash_path(path: &Path) -> u64 {

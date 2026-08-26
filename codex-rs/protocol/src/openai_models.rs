@@ -57,6 +57,7 @@ pub enum ReasoningEffort {
     XHigh,
     Max,
     Ultra,
+    Persistent,
     /// A model-defined effort value that this client does not know yet.
     Custom(String),
 }
@@ -73,6 +74,7 @@ impl ReasoningEffort {
             Self::XHigh => "xhigh",
             Self::Max => "max",
             Self::Ultra => "ultra",
+            Self::Persistent => "persistent",
             Self::Custom(effort) => effort,
         }
     }
@@ -139,6 +141,7 @@ impl FromStr for ReasoningEffort {
             "xhigh" => Ok(Self::XHigh),
             "max" => Ok(Self::Max),
             "ultra" => Ok(Self::Ultra),
+            "persistent" => Ok(Self::Persistent),
             "" => Err("reasoning_effort must not be empty".to_string()),
             effort => Ok(Self::Custom(effort.to_string())),
         }
@@ -297,11 +300,9 @@ pub enum ModelVisibility {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ConfigShellToolType {
-    Default,
-    Local,
+    #[serde(alias = "default", alias = "local", alias = "shell_command")]
     UnifiedExec,
     Disabled,
-    ShellCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, TS, JsonSchema)]
@@ -572,6 +573,8 @@ pub struct CollaborationModeMessages {
 pub struct AutoReviewMessages {
     pub policy: Option<String>,
     pub policy_template: Option<String>,
+    pub rejection_instructions: Option<String>,
+    pub timeout_instructions: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
@@ -884,6 +887,21 @@ mod tests {
     use serde_json::from_str;
     use serde_json::to_string;
 
+    #[test]
+    fn legacy_shell_model_metadata_deserializes_as_unified_exec() {
+        for legacy_shell_type in ["default", "local", "shell_command"] {
+            assert_eq!(
+                from_str::<ConfigShellToolType>(&format!("\"{legacy_shell_type}\""))
+                    .expect("legacy shell type"),
+                ConfigShellToolType::UnifiedExec
+            );
+        }
+        assert_eq!(
+            to_string(&ConfigShellToolType::UnifiedExec).expect("serialize unified shell type"),
+            "\"unified_exec\""
+        );
+    }
+
     fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
         ModelInfo {
             slug: "test-model".to_string(),
@@ -891,7 +909,7 @@ mod tests {
             description: None,
             default_reasoning_level: None,
             supported_reasoning_levels: vec![],
-            shell_type: ConfigShellToolType::ShellCommand,
+            shell_type: ConfigShellToolType::UnifiedExec,
             visibility: ModelVisibility::List,
             supported_in_api: true,
             priority: 1,
@@ -987,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_review_messages_preserve_missing_and_empty_template_values() {
+    fn auto_review_messages_preserve_missing_and_empty_values() {
         let missing_template: ModelMessages = from_str(
             r#"{
                 "instructions_template": null,
@@ -1004,7 +1022,9 @@ mod tests {
                 "instructions_variables": null,
                 "auto_review": {
                     "policy": "policy",
-                    "policy_template": ""
+                    "policy_template": "",
+                    "rejection_instructions": "",
+                    "timeout_instructions": ""
                 }
             }"#,
         )
@@ -1015,6 +1035,8 @@ mod tests {
             Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: None,
+                rejection_instructions: None,
+                timeout_instructions: None,
             })
         );
         assert_eq!(
@@ -1022,6 +1044,8 @@ mod tests {
             Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: Some(String::new()),
+                rejection_instructions: Some(String::new()),
+                timeout_instructions: Some(String::new()),
             })
         );
     }
@@ -1111,28 +1135,34 @@ mod tests {
         let serialized = to_string(&custom).expect("custom reasoning effort should serialize");
         let serialized_max = to_string(&ReasoningEffort::Max).expect("Max should serialize");
         let serialized_ultra = to_string(&ReasoningEffort::Ultra).expect("Ultra should serialize");
+        let serialized_persistent =
+            to_string(&ReasoningEffort::Persistent).expect("Persistent should serialize");
 
         assert_eq!(
             (
                 "high".parse(),
                 "max".parse(),
                 "ultra".parse(),
+                "persistent".parse(),
                 "future".parse(),
                 deserialized,
                 serialized,
                 serialized_max,
                 serialized_ultra,
+                serialized_persistent,
                 custom.to_string(),
             ),
             (
                 Ok(ReasoningEffort::High),
                 Ok(ReasoningEffort::Max),
                 Ok(ReasoningEffort::Ultra),
+                Ok(ReasoningEffort::Persistent),
                 Ok(custom.clone()),
                 custom,
                 r#""future""#.to_string(),
                 r#""max""#.to_string(),
                 r#""ultra""#.to_string(),
+                r#""persistent""#.to_string(),
                 "future".to_string(),
             )
         );
@@ -1385,6 +1415,8 @@ mod tests {
             auto_review: Some(AutoReviewMessages {
                 policy: Some("policy".to_string()),
                 policy_template: None,
+                rejection_instructions: Some("rejection instructions".to_string()),
+                timeout_instructions: Some("timeout instructions".to_string()),
             }),
             permissions: Some(PermissionMessages {
                 danger_full_access: None,
@@ -1520,7 +1552,7 @@ mod tests {
             "display_name": "Test Model",
             "description": null,
             "supported_reasoning_levels": [],
-            "shell_type": "shell_command",
+            "shell_type": "unified_exec",
             "visibility": "list",
             "supported_in_api": true,
             "priority": 1,
