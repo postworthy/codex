@@ -148,7 +148,7 @@ fn agent_assisted_update_command(
         failure_detail.push('…');
     }
     let prompt = format!(
-        "Automatic source update failed and needs agent-assisted recovery.\n\nRepository: {}\nTarget Codex release: {latest_version}\nFailure: {failure_detail}\n\nPerform the update repair now. Inspect the repository state, preserve fork-specific changes and unrelated user work, merge upstream/main, resolve any conflicts, and commit the merge if required. Run the repository-required formatting and relevant tests. Leave the checkout clean and ready for the updater to retry the release build and installation after this session exits. Do not merely explain the steps; perform the work. The failed automatic merge, if any, was aborted before this session started.",
+        "Automatic source update failed and needs agent-assisted recovery.\n\nRepository: {}\nTarget Codex release: {latest_version}\nFailure: {failure_detail}\n\nPerform the update repair now. Inspect the repository state, preserve fork-specific changes and unrelated user work, merge upstream/main, resolve any conflicts, and commit the merge if required. Run the repository-required formatting and relevant tests. Leave the checkout clean and ready for the updater to retry the release build and installation after this session exits. The retry runs inside the currently installed pre-update binary, so a fix made only to the Rust updater will not affect this retry; preserve backward compatibility at the repository script or command boundary that failed. Do not merely explain the steps; perform the work. The failed automatic merge, if any, was aborted before this session started.",
         build_dir.display()
     );
     let mut command = Command::new(codex_bin);

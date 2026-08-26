@@ -36,6 +36,8 @@ fn agent_assisted_update_runs_codex_in_checkout_with_failure_context() {
         "Failure: git merge failed with status 1. Conflicted paths before abort:\ncli/src/main.rs"
     ));
     assert!(prompt.contains("merge upstream/main"));
+    assert!(prompt.contains("currently installed pre-update binary"));
+    assert!(prompt.contains("preserve backward compatibility"));
     assert!(prompt.contains("Do not merely explain the steps; perform the work."));
 }
 

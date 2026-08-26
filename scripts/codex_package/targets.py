@@ -6,13 +6,21 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-_repo_root = os.environ.get("CODEX_REPO_ROOT")
-if _repo_root is None:
-    raise RuntimeError(
-        "CODEX_REPO_ROOT must point to the repository root; "
-        "run `just assemble-codex-package` to set it automatically"
-    )
-REPO_ROOT = Path(_repo_root)
+
+def resolve_repo_root(
+    environ: dict[str, str] = os.environ,
+    module_path: Path = Path(__file__),
+) -> Path:
+    if repo_root := environ.get("CODEX_REPO_ROOT"):
+        return Path(repo_root)
+
+    # Keep the stable script entrypoint compatible with source updaters built
+    # before CODEX_REPO_ROOT became part of the package-builder contract. The
+    # environment override remains authoritative for Bazel/runfiles layouts.
+    return module_path.resolve().parents[2]
+
+
+REPO_ROOT = resolve_repo_root()
 
 
 @dataclass(frozen=True)
