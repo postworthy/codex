@@ -44,6 +44,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
 
+use super::trusted_skills::GuardianTrustedSkillsFragment;
 use super::trusted_tools::GuardianTrustedToolFragment;
 
 pub(crate) const MODEL: &str = "gpt-5.6-luna";
@@ -93,6 +94,8 @@ pub struct LunaSamplingRequest {
     pub trusted_review_evidence: Vec<String>,
     /// Host-attested metadata for the current home-owned MCP tool or connector.
     pub trusted_tool_context: Option<GuardianTrustedToolFragment>,
+    /// Host-verified paths of user-owned skills invoked during this turn.
+    pub trusted_skill_paths: Vec<String>,
     /// Ordered untrusted input entries that the model should classify.
     pub input: Vec<String>,
     /// Optional bounded screenshots accompanying the transcript.
@@ -196,26 +199,34 @@ pub struct LunaSampler {
 }
 
 impl LunaSampler {
-    /// Opens the initial WebSockets before any sample is requested.
-    pub async fn connect(config: LunaSamplerConfig) -> Result<Self, LunaSamplerError> {
-        let sampler = Self {
+    pub(super) fn new(config: LunaSamplerConfig) -> Self {
+        Self {
             config,
             idle_connections: Arc::new(Mutex::new(Vec::with_capacity(MAX_WEBSOCKET_CONNECTIONS))),
             capacity: Arc::new(Semaphore::new(MAX_WEBSOCKET_CONNECTIONS)),
             active_requests: Mutex::new(VecDeque::with_capacity(MAX_WEBSOCKET_CONNECTIONS)),
-        };
+        }
+    }
+
+    pub(super) async fn prewarm(&self) {
         for _ in 0..INITIAL_WEBSOCKET_CONNECTIONS {
-            let connection = match sampler.open_connection().await {
+            let idle_connections = self
+                .idle_connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            if idle_connections >= self.capacity.available_permits() {
+                break;
+            }
+            let connection = match self.open_connection().await {
                 Ok(connection) => connection,
                 Err(_) => break,
             };
-            sampler
-                .idle_connections
+            self.idle_connections
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(connection);
         }
-        Ok(sampler)
     }
 
     async fn responses_endpoint(&self) -> ResponsesEndpoint {
@@ -468,6 +479,13 @@ impl LunaSampler {
         }
         if let Some(fragment) = request.trusted_tool_context {
             input.push(ContextualUserFragment::into(fragment));
+        }
+        if !request.trusted_skill_paths.is_empty() {
+            input.push(ContextualUserFragment::into(
+                GuardianTrustedSkillsFragment {
+                    paths: request.trusted_skill_paths,
+                },
+            ));
         }
         input.push(ResponseItem::Message {
             id: None,
