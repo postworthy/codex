@@ -1,3 +1,5 @@
+#[cfg(not(debug_assertions))]
+use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(any(not(debug_assertions), test))]
@@ -104,6 +106,16 @@ pub fn get_update_action() -> Option<UpdateAction> {
         return Some(source_action);
     }
     UpdateAction::from_install_context(InstallContext::current())
+}
+
+#[cfg(not(debug_assertions))]
+pub fn get_update_action_for_cached_version(codex_home: &Path) -> Option<UpdateAction> {
+    if let Some(latest_version) = crate::updates_cache::read_latest_version(codex_home)
+        && let Some(source_action) = get_source_git_update_action(Some(&latest_version))
+    {
+        return Some(source_action);
+    }
+    get_update_action()
 }
 
 #[cfg(not(debug_assertions))]

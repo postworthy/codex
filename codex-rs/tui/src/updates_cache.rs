@@ -26,6 +26,12 @@ pub(crate) fn read_version_info(version_file: &Path) -> anyhow::Result<VersionIn
     Ok(serde_json::from_str(&contents)?)
 }
 
+pub(crate) fn read_latest_version(codex_home: &Path) -> Option<String> {
+    read_version_info(&codex_home.join(VERSION_FILENAME))
+        .ok()
+        .map(|info| info.latest_version)
+}
+
 /// Persist a dismissal for the current latest version so we don't show
 /// the update popup again for this version.
 pub(crate) async fn dismiss_version(config: &Config, version: &str) -> anyhow::Result<()> {
