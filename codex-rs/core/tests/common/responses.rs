@@ -604,6 +604,7 @@ impl WebSocketTestServer {
         request_index: usize,
     ) -> WebSocketRequest {
         loop {
+            let notified = self.request_log_updated.notified();
             if let Some(request) = self
                 .connections
                 .lock()
@@ -614,7 +615,7 @@ impl WebSocketTestServer {
             {
                 return request;
             }
-            self.request_log_updated.notified().await;
+            notified.await;
         }
     }
 
@@ -1078,7 +1079,7 @@ where
 fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
-        .and(path_regex(".*/(responses|guardian)$"))
+        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
         .and(response_mock.clone());
     (mock, response_mock)
 }

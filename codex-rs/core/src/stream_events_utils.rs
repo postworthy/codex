@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use codex_extension_api::ExtensionData;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::items::TurnItem;
@@ -111,17 +112,20 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
             .await;
     }
     mark_thread_memory_mode_polluted_if_external_context(sess, turn_context, item).await;
+    let memory_usage_db = match sess.services.state_db.as_ref() {
+        Some(db) => db
+            .memories_for_version(turn_context.config.memories.version)
+            .await
+            .ok(),
+        None => None,
+    };
     let has_memory_citation = if let Some(memory_citation) =
         finalized_facts.and_then(|facts| facts.memory_citation.as_ref())
     {
-        record_stage1_output_usage_for_memory_citation(
-            sess.services.state_db.as_ref(),
-            memory_citation,
-        )
-        .await
-    } else {
-        record_stage1_output_usage_and_detect_memory_citation(sess.services.state_db.as_ref(), item)
+        record_stage1_output_usage_for_memory_citation(memory_usage_db.as_ref(), memory_citation)
             .await
+    } else {
+        record_stage1_output_usage_and_detect_memory_citation(memory_usage_db.as_ref(), item).await
     };
     if has_memory_citation {
         sess.record_memory_citation_for_turn(&turn_context.sub_id)
@@ -158,7 +162,7 @@ pub(crate) async fn mark_thread_memory_mode_polluted_if_external_context(
 }
 
 async fn record_stage1_output_usage_and_detect_memory_citation(
-    state_db_ctx: Option<&state_db::StateDbHandle>,
+    state_db_ctx: Option<&codex_state::MemoryStore>,
     item: &ResponseItem,
 ) -> bool {
     let Some(raw_text) = raw_assistant_output_text_from_item(item) else {
@@ -173,7 +177,7 @@ async fn record_stage1_output_usage_and_detect_memory_citation(
 }
 
 async fn record_stage1_output_usage_for_memory_citation(
-    state_db_ctx: Option<&state_db::StateDbHandle>,
+    state_db_ctx: Option<&codex_state::MemoryStore>,
     memory_citation: &MemoryCitation,
 ) -> bool {
     let thread_ids = thread_ids_from_memory_citation(memory_citation);
@@ -182,7 +186,7 @@ async fn record_stage1_output_usage_for_memory_citation(
     }
 
     if let Some(db) = state_db_ctx {
-        let _ = db.memories().record_stage1_output_usage(&thread_ids).await;
+        let _ = db.record_stage1_output_usage(&thread_ids).await;
     }
     true
 }
@@ -191,7 +195,7 @@ async fn record_stage1_output_usage_for_memory_citation(
 /// queuing any tool execution futures. This records items immediately so
 /// history and rollout stay in sync even if the turn is later cancelled.
 pub(crate) type InFlightFuture<'f> =
-    Pin<Box<dyn Future<Output = Result<ResponseInputItem>> + Send + 'f>>;
+    Pin<Box<dyn Future<Output = Result<ResponseItemEnvelope>> + Send + 'f>>;
 
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
@@ -411,6 +415,7 @@ pub(crate) async fn handle_non_tool_response_item(
         ResponseItem::WebSearchCall { .. } => "web_search_call",
         ResponseItem::ImageGenerationCall { .. } => "image_generation_call",
         ResponseItem::Compaction { .. } => "compaction",
+        ResponseItem::ConfigurationUpdate { .. } => "configuration_update",
         ResponseItem::CompactionTrigger { .. } => "compaction_trigger",
         ResponseItem::ContextCompaction { .. } => "context_compaction",
         ResponseItem::Other => "other",

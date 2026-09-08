@@ -1,67 +1,12 @@
-use super::GuardianTrustedSkillsFragment;
 use super::MAX_TRUSTED_SKILL_PATHS_BYTES;
-use super::MAX_TRUSTED_SKILL_TOKENS;
 use super::MAX_TRUSTED_SKILLS;
-use super::TRUSTED_SKILLS_PREFIX;
 use super::TrustedSkillInvocations;
 use super::TrustedSkillRoots;
 use anyhow::Result;
-use codex_extension_api::ContextualUserFragment;
-use codex_protocol::protocol::TruncationPolicy;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
-
-fn rendered_paths(paths: Vec<String>) -> Vec<String> {
-    let rendered = GuardianTrustedSkillsFragment { paths }.render();
-    assert!(rendered.len() <= TruncationPolicy::Tokens(MAX_TRUSTED_SKILL_TOKENS).byte_budget());
-    serde_json::from_str(
-        rendered
-            .strip_prefix(TRUSTED_SKILLS_PREFIX)
-            .expect("trusted skill context should contain JSON evidence"),
-    )
-    .expect("trusted skill evidence should remain valid JSON")
-}
-
-#[test]
-fn renders_verified_skill_paths() {
-    assert_eq!(
-        rendered_paths(vec!["/home/user/.codex/skills/demo/SKILL.md".to_owned()]),
-        vec!["/home/user/.codex/skills/demo/SKILL.md"],
-    );
-}
-
-#[test]
-fn bounds_escaped_skill_paths_without_corrupting_json_or_utf8() {
-    let paths = (0..MAX_TRUSTED_SKILLS)
-        .map(|index| {
-            format!(
-                "/home/user/.codex/skills/{index:03}/{}SKILL.md",
-                "\u{0001}é".repeat(80)
-            )
-        })
-        .collect::<Vec<_>>();
-    let retained = rendered_paths(paths.clone());
-
-    assert!(!retained.is_empty());
-    assert!(retained.len() < paths.len());
-    assert!(retained.iter().all(|path| paths.contains(path)));
-}
-
-#[test]
-fn preserves_multiple_invoked_skill_paths() {
-    assert_eq!(
-        rendered_paths(vec![
-            "/home/user/.codex/skills/first/SKILL.md".to_owned(),
-            "/home/user/.codex/skills/second/SKILL.md".to_owned(),
-        ]),
-        vec![
-            "/home/user/.codex/skills/first/SKILL.md",
-            "/home/user/.codex/skills/second/SKILL.md",
-        ],
-    );
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trusts_only_user_owned_skill_roots() -> Result<()> {
@@ -137,21 +82,25 @@ async fn rejects_skills_that_escape_user_roots_through_symlinks() -> Result<()> 
 
 #[test]
 fn invoked_skill_paths_are_deduplicated_and_bounded() {
-    let skills = TrustedSkillInvocations::default();
+    let mut skills = TrustedSkillInvocations::default();
     for index in 0..MAX_TRUSTED_SKILLS.saturating_mul(2) {
         let path = format!("/home/user/.codex/skills/{index:03}/SKILL.md");
         skills.record(path.clone());
         skills.record(path);
     }
 
-    let snapshot = skills.snapshot();
-    assert_eq!(snapshot.len(), MAX_TRUSTED_SKILLS);
+    assert_eq!(
+        skills.into_paths(),
+        (0..MAX_TRUSTED_SKILLS)
+            .map(|index| format!("/home/user/.codex/skills/{index:03}/SKILL.md"))
+            .collect::<Vec<_>>()
+    );
 
-    let bounded = TrustedSkillInvocations::default();
+    let mut bounded = TrustedSkillInvocations::default();
     for index in 0..MAX_TRUSTED_SKILLS {
         bounded.record(format!("{index:03}{}", "x".repeat(500)));
     }
-    let snapshot = bounded.snapshot();
+    let snapshot = bounded.into_paths();
     assert!(snapshot.len() < MAX_TRUSTED_SKILLS);
     assert!(snapshot.iter().map(String::len).sum::<usize>() <= MAX_TRUSTED_SKILL_PATHS_BYTES);
 }
